@@ -7,7 +7,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QSettings, Qt  # noqa: E402
+from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -34,10 +34,13 @@ def app():
 
 
 def wait_for(condition, ms=20000):
+    # A real event loop, not QTest.qWait: qWait keeps the GIL and starves background threads.
     for _ in range(ms // 50):
         if condition():
             return True
-        QTest.qWait(50)
+        loop = QEventLoop()
+        QTimer.singleShot(50, loop.quit)
+        loop.exec()
     return False
 
 

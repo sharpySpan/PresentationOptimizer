@@ -13,9 +13,11 @@ Back-to-back presentations without the set-up time: one folder, put the files in
 - **Mac:** right-click the app → **Open** → **Open**.
 - **Windows:** SmartScreen → **More info** → **Run anyway**.
 
-**Slide decks** (.pptx, .key, .odp) need a converter on the computer: PowerPoint (Windows), Keynote (Mac) or the free [LibreOffice](https://www.libreoffice.org). PDFs, images and videos work without one.
+**Nothing to set up.** Install, open, and put the presentations in *Documents → Showrunner Presentations* (or drag them onto the list). If the computer has no PowerPoint or Keynote, Showrunner downloads the free LibreOffice converter by itself the first time it starts (~350 MB, one time only, no admin rights needed).
 
 ## What it does
+- Zero set-up: watched folder, slide converter fetched automatically, screens picked automatically
+- `Name.pptx` + `Name.pdf`: the PDF is shown (looks exactly like the original), notes and sound come from the .pptx
 - Setup screen with a preview of every file; order by drag, name, date or random
 - Beamer shows the slides; the monitor shows a console with speaker notes, next slide, timer and running order
 - All audio and video levelled to the same loudness, master volume 0–200%, **Alt+S** to mute

@@ -3,20 +3,21 @@ from __future__ import annotations
 
 import random
 import shutil
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QSettings, QSize, QStandardPaths, Qt, QTimer, QUrl, Signal
+from PySide6.QtCore import QFileSystemWatcher, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox, QStyle,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QStyle,
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from . import system
+from . import libreoffice, system
 from .audio import AudioBus
-from .library import Presentation, load_order, natural_key, save_order
-from .prepare import CACHE_DIRNAME, Prepared, PrepareWorker, load_cached
+from .library import Presentation, kind_for, load_order, natural_key, needs_converter, save_order
+from .prepare import CACHE_DIRNAME, Prepared, PrepareWorker, is_current, load_cached
 from .show import ShowController, ShowSettings
 
 PATH_ROLE = Qt.UserRole
@@ -26,9 +27,11 @@ THUMB = QSize(192, 108)
 
 class OrderList(QListWidget):
     reordered = Signal()
+    files_dropped = Signal(list)
 
     def __init__(self):
         super().__init__()
+        self.placeholder = ""
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -36,9 +39,54 @@ class OrderList(QListWidget):
         self.setSpacing(3)
         self.setUniformItemSizes(True)
 
+    def _external(self, event) -> bool:
+        return event.mimeData().hasUrls() and event.source() is None
+
+    def dragEnterEvent(self, event):
+        if self._external(event):
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._external(event):
+            event.acceptProposedAction()
+        else:
+            super().dragMoveEvent(event)
+
     def dropEvent(self, event):
+        if self._external(event):  # Files from Finder/Explorer
+            event.acceptProposedAction()
+            self.files_dropped.emit([Path(u.toLocalFile()) for u in event.mimeData().urls() if u.isLocalFile()])
+            return
         super().dropEvent(event)
         self.reordered.emit()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.count() == 0 and self.placeholder:
+            painter = QPainter(self.viewport())
+            painter.setPen(QColor("#8a8f96"))
+            painter.drawText(self.viewport().rect().adjusted(40, 0, -40, 0), Qt.AlignCenter | Qt.TextWordWrap,
+                             self.placeholder)
+
+
+class ConverterDownload(QThread):
+    """Fetches LibreOffice in the background (see libreoffice.py)."""
+
+    progress = Signal(int, int, str)  # kB done, kB total, text
+    done = Signal(str)                # error message, empty on success
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cancel = threading.Event()
+
+    def run(self):
+        try:
+            libreoffice.install(lambda done, total, text: self.progress.emit(done >> 10, total >> 10, text), self.cancel)
+            self.done.emit("")
+        except Exception as exc:
+            self.done.emit(str(exc) or exc.__class__.__name__)
 
 
 def _thumb_icon(path: Path | None, text: str = "") -> QIcon:
@@ -72,6 +120,11 @@ class MainWindow(QMainWindow):
         self.status: dict[str, str] = {}
         self.controller: ShowController | None = None
         self.bus = AudioBus(self)
+        self.waiting_for_converter: list[Presentation] = []
+        self.download: ConverterDownload | None = None
+        self.download_failures = 0
+        self.download_retry = QTimer(self, singleShot=True)
+        self.download_retry.timeout.connect(self._ensure_converter)
 
         cache_root = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "prepared"
         self.cache_root = cache_root
@@ -88,6 +141,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._load_settings()
+        self._ensure_converter()
         QShortcut(QKeySequence("Alt+S"), self, self.bus.toggle_mute)
         app = QGuiApplication.instance()
         app.screenAdded.connect(lambda _: self._fill_screens())
@@ -111,6 +165,7 @@ class MainWindow(QMainWindow):
 
         self.list = OrderList()
         self.list.reordered.connect(self._on_reordered)
+        self.list.files_dropped.connect(self._add_files)
         self.list.itemChanged.connect(self._on_item_changed)
         self.list.currentRowChanged.connect(self._update_details)
         self.list.itemDoubleClicked.connect(lambda _: self.start_show(True))
@@ -206,12 +261,16 @@ class MainWindow(QMainWindow):
         show_form.addRow(self.windowed)
         show_form.addRow("Talk length", self.talk_spin)
         show_form.addRow("Auto-start next", self.auto_spin)
-        converters = system.converter_names()
-        conv = QLabel("Slide converter: " + (", ".join(converters) if converters
-                                              else "none found - install LibreOffice for .pptx/.key/.odp"))
-        conv.setWordWrap(True)
-        conv.setStyleSheet("color:gray;" if converters else "color:#d0342c;")
-        show_form.addRow(conv)
+        self.converter_label = QLabel()
+        self.converter_label.setWordWrap(True)
+        self.converter_label.setStyleSheet("color:gray;")
+        self.converter_bar = QProgressBar()
+        self.converter_bar.setTextVisible(False)
+        self.converter_bar.setMaximumHeight(8)
+        self.converter_bar.hide()
+        show_form.addRow(self.converter_label)
+        show_form.addRow(self.converter_bar)
+        self._update_converter_label()
         show_box = QGroupBox("Show")
         show_box.setLayout(show_form)
 
@@ -259,10 +318,19 @@ class MainWindow(QMainWindow):
         self.bus.set_percent(s.value("volume", 100, type=int))
         self._fill_devices(s.value("audio_device", ""))
         self._fill_screens()
-        folder = s.value("folder", "")
-        if folder and Path(folder).is_dir():
-            self.open_folder(Path(folder))
+        folder = Path(s.value("folder", "") or self._default_folder())
+        if not folder.is_dir():
+            folder = self._default_folder()
+        self.open_folder(folder)
         self._update_summary()
+
+    @staticmethod
+    def _default_folder() -> Path:
+        """Works out of the box: a folder in Documents, watched from the first launch."""
+        documents = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
+        folder = Path(documents) / "Showrunner Presentations"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
 
     def _save_settings(self):
         s = self.settings
@@ -302,9 +370,16 @@ class MainWindow(QMainWindow):
                 # Defaults: console on the main screen, beamer on the first other screen.
                 index = next((i for i, s in enumerate(screens) if (s is primary) == prefer_primary), 0)
             combo.setCurrentIndex(index)
+        if len(screens) > 1 and self.beamer_combo.currentIndex() == self.console_combo.currentIndex():
+            # e.g. saved on a laptop alone, now a beamer is plugged in: use it.
+            console = self.console_combo.currentIndex()
+            self.beamer_combo.setCurrentIndex(next(i for i in range(len(screens)) if i != console))
 
     def closeEvent(self, event):
         self._save_settings()
+        if self.download is not None:
+            self.download.cancel.set()
+            self.download.wait(5000)
         self.worker.stop()
         super().closeEvent(event)
 
@@ -321,6 +396,8 @@ class MainWindow(QMainWindow):
             self.watcher.removePaths(self.watcher.directories())
         self.folder = folder
         self.folder_label.setText(str(folder))
+        self.list.placeholder = (f"Put the presentations in\n{folder}\n\nor drag them here. "
+                                 "Everything is prepared automatically.")
         self.watcher.addPath(str(folder))
         self.prepared.clear()
         self.status.clear()
@@ -341,14 +418,93 @@ class MainWindow(QMainWindow):
     def _queue_unprepared(self):
         for item in self.items:
             key = str(item.path)
-            if key in self.prepared or self.status.get(key) == "Waiting…":
+            if not item.path.exists() or key in self.status:
                 continue
-            cached = load_cached(item, self.cache_root) if item.path.exists() else None
+            if key in self.prepared and is_current(item, self.prepared[key]):
+                continue  # A replaced file gets a new cache key, so it is prepared again.
+            self.prepared.pop(key, None)
+            cached = load_cached(item, self.cache_root)
             if cached:
                 self.prepared[key] = cached
+            elif needs_converter(item) and not self._has_converter():
+                self.status[key] = "Waiting for the slide converter…"
+                self.waiting_for_converter.append(item)
+                self._ensure_converter()
             else:
                 self.status[key] = "Waiting…"
                 self.worker.add(item)
+
+    def _add_files(self, paths: list[Path]):
+        """Files dragged onto the list are copied into the folder, which then picks them up."""
+        if not self.folder:
+            return
+        for path in paths:
+            if kind_for(path) is None or path.parent == self.folder:
+                continue
+            target = self.folder / path.name
+            if path.is_dir():
+                shutil.copytree(path, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(path, target)
+        self.reload_folder()
+
+    # --- slide converter -------------------------------------------------------
+
+    @staticmethod
+    def _has_converter() -> bool:
+        return bool(system.converter_names())
+
+    def _ensure_converter(self):
+        """No PowerPoint/Keynote/LibreOffice? Fetch LibreOffice by itself, no questions asked."""
+        if self._has_converter() or self.download is not None:
+            return
+        self.download = ConverterDownload(self)
+        self.download.progress.connect(self._on_download_progress)
+        self.download.done.connect(self._on_download_done)
+        self.download.start()
+        self._update_converter_label()
+
+    def _on_download_progress(self, done: int, total: int, text: str):
+        self.converter_bar.show()
+        self.converter_bar.setRange(0, total)
+        self.converter_bar.setValue(done)
+        pct = f" {done * 100 // total}%" if total else ""
+        self.converter_label.setText(f"Getting the slide converter (one time only): {text.rstrip('…')}{pct}")
+        self.converter_label.setStyleSheet("color:gray;")
+
+    def _on_download_done(self, error: str):
+        self.download.deleteLater()
+        self.download = None
+        self.converter_bar.hide()
+        system.soffice_path.cache_clear()
+        if error and not self._has_converter():
+            self.download_failures += 1
+            minutes = min(10, 2 ** (self.download_failures - 1))
+            self.download_retry.start(minutes * 60_000)
+            self.converter_label.setText(f"Couldn't get the slide converter ({error}). Trying again in {minutes} min.")
+            self.converter_label.setStyleSheet("color:#c98a00;")
+            return
+        self._update_converter_label()
+        waiting, self.waiting_for_converter = self.waiting_for_converter, []
+        for item in waiting:
+            self.status[str(item.path)] = "Waiting…"
+            self.worker.add(item)
+        for item in self.items:  # Decks that failed before the converter arrived.
+            key = str(item.path)
+            prepared = self.prepared.get(key)
+            if prepared is not None and prepared.error and needs_converter(item):
+                self.prepared.pop(key)
+                self.status[key] = "Waiting…"
+                self.worker.add(item)
+        self._refresh_list()
+
+    def _update_converter_label(self):
+        names = system.converter_names()
+        if names:
+            self.converter_label.setText("Slide converter: " + ", ".join(names))
+            self.converter_label.setStyleSheet("color:gray;")
+        elif self.download is not None:
+            self.converter_label.setText("Getting the slide converter (one time only)…")
 
     def _on_progress(self, key: str, text: str):
         self.status[key] = text

@@ -24,7 +24,7 @@ from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 from . import convert, loudness, pptx_info
-from .library import Kind, Presentation, resolve_web_url
+from .library import DECK_KINDS, Kind, Presentation, paired_pdf, resolve_web_url
 
 CACHE_VERSION = 2
 CACHE_DIRNAME = ".showrunner"
@@ -69,9 +69,25 @@ class Prepared:
         return len(self.slides)
 
 
+def cache_key(item: Presentation) -> str:
+    """Changes whenever the file (or its paired PDF) is replaced, so new versions are re-prepared."""
+    parts = [item.path.name]
+    for path in (item.path, paired_pdf(item.path) if item.kind in DECK_KINDS else None):
+        if path is not None:
+            stat = path.stat()
+            parts += [str(stat.st_size), str(stat.st_mtime_ns)]
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()[:16]
+
+
+def is_current(item: Presentation, prepared: Prepared) -> bool:
+    try:
+        return bool(prepared.dir) and Path(prepared.dir).name == cache_key(item)
+    except OSError:
+        return False
+
+
 def cache_dir(item: Presentation, fallback_root: Path) -> Path:
-    stat = item.path.stat()
-    key = hashlib.sha1(f"{item.path.name}|{stat.st_size}|{stat.st_mtime_ns}".encode()).hexdigest()[:16]
+    key = cache_key(item)
     for root in (item.path.parent / CACHE_DIRNAME, fallback_root):
         try:
             target = root / key
@@ -108,7 +124,12 @@ def prepare(item: Presentation, fallback_root: Path, progress=lambda text: None)
     try:
         if item.kind is Kind.PDF:
             _prepare_pdf(item, result, item.path, None, progress)
-        elif item.kind in (Kind.KEYNOTE, Kind.POWERPOINT, Kind.OPENDOCUMENT):
+        elif item.kind in DECK_KINDS and paired_pdf(item.path):
+            # The student also exported a PDF: it looks exactly like their own app, no converter needed.
+            shutil.copyfile(paired_pdf(item.path), folder / "slides.pdf")
+            deck_src = item.path if zipfile.is_zipfile(item.path) and item.kind is Kind.POWERPOINT else None
+            _prepare_pdf(item, result, folder / "slides.pdf", deck_src, progress)
+        elif item.kind in DECK_KINDS:
             progress("Converting slides…")
             with tempfile.TemporaryDirectory(prefix="showrunner-") as tmp:
                 pdf, pptx = convert.convert(item.path, Path(tmp))

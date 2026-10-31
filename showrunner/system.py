@@ -70,7 +70,13 @@ def soffice_path() -> str | None:
     for candidate in candidates:
         if os.path.exists(candidate):
             return candidate
-    return shutil.which("soffice") or shutil.which("libreoffice")
+    found = shutil.which("soffice") or shutil.which("libreoffice")
+    if found:
+        return found
+    from .libreoffice import installed_soffice  # Our own download (see libreoffice.py).
+
+    bundled = installed_soffice()
+    return str(bundled) if bundled else None
 
 
 def converter_names() -> list[str]:

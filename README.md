@@ -7,8 +7,9 @@ files, put them in order, press Start. Runs on **macOS, Windows and Linux**.
   and next slide, **speaker notes**, a talk timer, the running order and all sound controls.
 - **Same loudness for everyone.** Every audio and video clip is levelled to the same loudness
   (EBU R128, -14 LUFS) while preparing. One master slider goes **0% to 200%**. **Alt+S** mutes.
-- **Prepared ahead.** As soon as you pick the folder, every file is converted in the background:
-  slides, notes, sound and a preview thumbnail. During the show, switching speakers is instant.
+- **Prepared ahead.** Every file in the folder is converted in the background: slides, notes,
+  sound and a preview thumbnail. During the show, switching speakers is instant.
+- **Nothing to set up.** Install, open, put the presentations in the folder. That's it.
 
 ## What it plays
 
@@ -25,20 +26,32 @@ files, put them in order, press Start. Runs on **macOS, Windows and Linux**.
 don't play (each slide shows its final state). Audio and video on a slide do play: automatically
 if the deck says so, otherwise on the next click, just like PowerPoint.
 
-**Converter needed for slide decks:** PowerPoint (Windows), Keynote (Mac) or the free
-[LibreOffice](https://www.libreoffice.org) (any OS). The set-up screen says which one it found.
+**Slide decks are converted** by PowerPoint (Windows) or Keynote (Mac) when installed. If neither
+is there, Showrunner downloads [LibreOffice](https://www.libreoffice.org) by itself on first
+launch: about 350 MB, one time only, no admin rights, checked against the official checksum,
+kept in Showrunner's own folder. Decks wait in the list until it's ready and then get prepared
+automatically. If the download fails (no internet), it quietly tries again.
+
+**Tip for exact looks:** if a student hands in `Name.pptx` *and* `Name.pdf` (exported from their
+own PowerPoint/Keynote), Showrunner shows the PDF and still takes notes and sound from the
+`.pptx`. No converter needed, and the slides look exactly as they made them.
 
 ## Using it
 
-1. **Choose folder…**. Every file appears with a preview and its status: slides, audio/video,
-   notes, or a warning.
-2. Put them in order: drag, the ▲▼ buttons, or *Sort by name / date / random*. Untick anyone
+1. Put the presentations in **Documents → Showrunner Presentations** (created on first launch),
+   or drag them onto the list. Every file appears with a preview and its status.
+2. Optional: change the order (drag, ▲▼, or *Sort by name / date / random*) or untick anyone
    who's absent. The order is saved in the folder.
-3. Under *Show*, choose which screen is the **Beamer** and which is the **Console**.
-   *Test mode* runs both as normal windows, handy for trying it on one laptop.
-4. Click **Test sound**, pick the output (HDMI, speaker…), set the level, and press **Start the show**.
+3. Press **Start the show**.
 
-Files added to the folder later appear at the bottom and get prepared automatically.
+Everything else is automatic:
+- **Screens:** the beamer goes on the external screen and the console on the laptop.
+- **Sound:** follows the computer's current output.
+- **New files:** students' files added later appear at the bottom.
+- **Replaced files:** they get prepared again.
+
+Use *Choose folder…* to point it at another folder, e.g. a shared drive. *Test mode* runs both
+views as normal windows, handy for trying it on one laptop.
 
 ### Keys (work in both windows; clickers work too)
 

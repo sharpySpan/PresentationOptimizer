@@ -108,10 +108,15 @@ def natural_key(text: str) -> list:
     return [int(part) if part.isdigit() else part.casefold() for part in re.split(r"(\d+)", text)]
 
 
+DECK_KINDS = {Kind.KEYNOTE, Kind.POWERPOINT, Kind.OPENDOCUMENT}
+
+
 def scan_folder(folder: Path) -> list[Path]:
     """Every playable file directly inside the folder.
 
     Old-style Keynote documents are package directories, so '.key' directories count too.
+    A PDF with the same name as a deck ('Sam.pptx' + 'Sam.pdf') belongs to that deck, so it
+    isn't listed separately.
     """
     found = []
     for entry in folder.iterdir():
@@ -120,7 +125,25 @@ def scan_folder(folder: Path) -> list[Path]:
             continue
         if entry.is_file() or (kind is Kind.KEYNOTE and entry.is_dir()):
             found.append(entry)
+    deck_stems = {p.stem.casefold() for p in found if kind_for(p) in DECK_KINDS}
+    found = [p for p in found if not (kind_for(p) is Kind.PDF and p.stem.casefold() in deck_stems)]
     return sorted(found, key=lambda p: natural_key(p.name))
+
+
+def paired_pdf(path: Path) -> Path | None:
+    """'Sam.pptx' -> 'Sam.pdf' next to it (any capitalisation), exported by the student's own app."""
+    stem = path.stem.casefold()
+    try:
+        for sibling in path.parent.iterdir():
+            if sibling.is_file() and sibling.suffix.lower() == ".pdf" and sibling.stem.casefold() == stem:
+                return sibling
+    except OSError:
+        pass
+    return None
+
+
+def needs_converter(item: "Presentation") -> bool:
+    return item.kind in DECK_KINDS and paired_pdf(item.path) is None
 
 
 def merge_order(saved: list[str], disabled: set[str], files: list[Path]) -> list[Presentation]:
