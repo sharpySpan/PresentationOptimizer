@@ -150,27 +150,48 @@ def install(progress=lambda done, total, text: None, cancel: threading.Event | N
     return installed_soffice(root)
 
 
+DOWNLOAD_ATTEMPTS = 6
+
+
 def _download(url: str, dest: Path, expected: str, version: str, progress, cancel: threading.Event):
+    """download.documentfoundation.org sends every request to a random mirror. Some mirrors are
+    slow, break off, or serve an incomplete certificate chain (Linux can't complete those, unlike
+    Windows/macOS), so each attempt simply asks for another mirror. Certificates are always checked."""
+    errors = []
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        try:
+            _download_once(url, dest, expected, version, progress, cancel)
+            return
+        except Cancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 - network trouble of any kind: try another mirror
+            errors.append(str(getattr(exc, "reason", exc)) or exc.__class__.__name__)
+            progress(0, 0, f"Download interrupted, trying another server ({attempt + 2}/{DOWNLOAD_ATTEMPTS})…")
+    raise InstallError(f"Couldn't download LibreOffice ({errors[-1]})")
+
+
+def _download_once(url: str, dest: Path, expected: str, version: str, progress, cancel: threading.Event):
     partial = dest.with_name(dest.name + ".part")
     digest = hashlib.sha256()
-    with _open(url, timeout=60) as response, partial.open("wb") as out:
-        total = int(response.headers.get("Content-Length") or 0)
-        done = 0
-        while True:
-            if cancel.is_set():
-                out.close()
-                partial.unlink(missing_ok=True)
-                raise Cancelled("Download cancelled")
-            chunk = response.read(1 << 20)
-            if not chunk:
-                break
-            out.write(chunk)
-            digest.update(chunk)
-            done += len(chunk)
-            progress(done, total, f"Downloading LibreOffice {version}…")
-    if digest.hexdigest() != expected:
+    try:
+        with _open(url, timeout=60) as response, partial.open("wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done = 0
+            while True:
+                if cancel.is_set():
+                    raise Cancelled("Download cancelled")
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                digest.update(chunk)
+                done += len(chunk)
+                progress(done, total, f"Downloading LibreOffice {version}…")
+        if digest.hexdigest() != expected:
+            raise InstallError("Download was damaged (checksum mismatch)")
+    except BaseException:
         partial.unlink(missing_ok=True)
-        raise InstallError("Download was damaged (checksum mismatch) - please try again")
+        raise
     partial.replace(dest)
 
 

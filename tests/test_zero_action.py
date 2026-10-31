@@ -2,6 +2,7 @@
 import io
 import os
 import tarfile
+import threading
 import time
 
 import pytest
@@ -135,3 +136,42 @@ def test_hands_off(app, tmp_path, media, monkeypatch):  # noqa: F811
     assert state["downloads"] == 1
 
     window.close()
+
+
+def test_download_tries_other_mirrors(tmp_path, monkeypatch):
+    import hashlib
+    import ssl
+    import urllib.error
+
+    payload = b"libreoffice package" * 1000
+    calls = []
+
+    class Response(io.BytesIO):
+        headers = {"Content-Length": str(len(payload))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_open(url, timeout=30):
+        calls.append(url)
+        if len(calls) == 1:
+            raise urllib.error.URLError(ssl.SSLCertVerificationError("unable to get local issuer certificate"))
+        if len(calls) == 2:
+            return Response(payload[:500])  # Mirror broke off: checksum mismatch.
+        return Response(payload)
+
+    monkeypatch.setattr(libreoffice, "_open", fake_open)
+    dest = tmp_path / "lo.msi"
+    libreoffice._download("https://example/lo.msi", dest, hashlib.sha256(payload).hexdigest(), "26.8",
+                          lambda *a: None, threading.Event())
+    assert dest.read_bytes() == payload and len(calls) == 3
+    assert not dest.with_name("lo.msi.part").exists()
+
+    calls.clear()
+    monkeypatch.setattr(libreoffice, "_open", lambda url, timeout=30: (_ for _ in ()).throw(OSError("offline")))
+    with pytest.raises(libreoffice.InstallError, match="offline"):
+        libreoffice._download("https://example/lo.msi", tmp_path / "x.msi", "0", "26.8", lambda *a: None,
+                              threading.Event())
