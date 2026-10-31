@@ -11,7 +11,7 @@ from PySide6.QtCore import QEventLoop, QSettings, Qt, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from showrunner import convert  # noqa: E402
+from showrunner import convert, system  # noqa: E402
 from showrunner.pdf import fitz  # noqa: E402
 from test_pipeline import make_deck, media  # noqa: E402,F401
 
@@ -57,6 +57,8 @@ def test_full_show(app, tmp_path, media, monkeypatch):  # noqa: F811
         return workdir / "slides.pdf", src
 
     monkeypatch.setattr(convert, "convert", fake_convert)
+    # Pretend a converter is installed, or decks wait for (and the app starts) a real LibreOffice download.
+    monkeypatch.setattr(system, "converter_names", lambda: ["LibreOffice"])
 
     from showrunner.main_window import MainWindow
 
