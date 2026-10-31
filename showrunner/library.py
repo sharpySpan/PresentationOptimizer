@@ -142,8 +142,22 @@ def paired_pdf(path: Path) -> Path | None:
     return None
 
 
+STALE_PDF_SECONDS = 120
+
+
+def fresh_paired_pdf(path: Path) -> Path | None:
+    """The paired PDF, unless the deck was saved again after it was exported (then it's outdated)."""
+    pdf = paired_pdf(path)
+    try:
+        if pdf is not None and pdf.stat().st_mtime + STALE_PDF_SECONDS < path.stat().st_mtime:
+            return None
+    except OSError:
+        return None
+    return pdf
+
+
 def needs_converter(item: "Presentation") -> bool:
-    return item.kind in DECK_KINDS and paired_pdf(item.path) is None
+    return item.kind in DECK_KINDS and fresh_paired_pdf(item.path) is None
 
 
 def merge_order(saved: list[str], disabled: set[str], files: list[Path]) -> list[Presentation]:

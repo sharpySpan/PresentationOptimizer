@@ -16,7 +16,9 @@ from enum import Enum, auto
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QRectF, QSizeF, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QImage, QPainter, QPixmap, QScreen
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QGuiApplication, QImage, QMovie, QPainter, QPixmap, QScreen, QTransform,
+)
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFrame, QGraphicsScene, QGraphicsView, QGridLayout, QHBoxLayout, QLabel,
     QListWidget, QListWidgetItem, QPushButton, QSlider, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
@@ -25,7 +27,7 @@ from PySide6.QtWidgets import (
 from . import system
 from .audio import AudioBus
 from .library import Presentation
-from .prepare import Prepared, prepare
+from .prepare import Prepared, is_animated, is_current, prepare
 
 NEXT_KEYS = {Qt.Key_Right, Qt.Key_Down, Qt.Key_PageDown, Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter, Qt.Key_N}
 PREV_KEYS = {Qt.Key_Left, Qt.Key_Up, Qt.Key_PageUp, Qt.Key_Backspace, Qt.Key_P}
@@ -170,7 +172,7 @@ class MessagePage(QWidget):
 
 
 class StageView(QGraphicsView):
-    """A slide picture with live video items placed where the video sits on the slide."""
+    """A slide picture with live video items and animated GIFs placed where they sit on the slide."""
 
     def __init__(self):
         super().__init__()
@@ -185,6 +187,7 @@ class StageView(QGraphicsView):
         self.pix_item.setTransformationMode(Qt.SmoothTransformation)
         self.aspect = 16 / 9
         self.videos: list[tuple[object, tuple[float, float, float, float]]] = []
+        self.gifs: list[tuple[object, QMovie, tuple[float, float, float, float]]] = []
         self.on_resize = None
 
     def slide_rect(self) -> QRectF:
@@ -209,11 +212,27 @@ class StageView(QGraphicsView):
         self._layout()
         return item
 
+    def add_gif(self, path: Path, rect: tuple[float, float, float, float]):
+        movie = QMovie(str(path), parent=self)
+        movie.setCacheMode(QMovie.CacheAll)
+        item = self.scene().addPixmap(QPixmap())
+        item.setTransformationMode(Qt.SmoothTransformation)
+        movie.frameChanged.connect(lambda _n, item=item, movie=movie: (item.setPixmap(movie.currentPixmap()),
+                                                                       self._layout()))
+        self.gifs.append((item, movie, rect))
+        movie.start()  # QMovie loops the way the GIF says (usually forever), like PowerPoint.
+        return movie
+
     def clear_videos(self):
         for item, _ in self.videos:
             self.scene().removeItem(item)
             item.deleteLater()
         self.videos.clear()
+        for item, movie, _ in self.gifs:
+            movie.stop()
+            movie.deleteLater()
+            self.scene().removeItem(item)
+        self.gifs.clear()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -231,6 +250,12 @@ class StageView(QGraphicsView):
         for item, (x, y, w, h) in self.videos:
             item.setPos(r.x() + x * r.width(), r.y() + y * r.height())
             item.setSize(QSizeF(w * r.width(), h * r.height()))
+        for item, _, (x, y, w, h) in self.gifs:
+            size = item.pixmap().size()
+            if size.isEmpty():
+                continue
+            item.setPos(r.x() + x * r.width(), r.y() + y * r.height())
+            item.setTransform(QTransform.fromScale(w * r.width() / size.width(), h * r.height() / size.height()))
 
 
 class Toast(QLabel):
@@ -541,10 +566,14 @@ class ShowController(QObject):
     finished = Signal(int)  # index of the presentation we stopped at
 
     def __init__(self, items: list[Presentation], prepared: dict[str, Prepared], bus: AudioBus,
-                 settings: ShowSettings, parent=None):
+                 settings: ShowSettings, parent=None, request_prepare=None):
         super().__init__(parent)
         self.items = items
-        self.prepared = prepared
+        self.prepared = prepared  # Shared with the set-up window, which fills in finished preparations.
+        self.request_prepare = request_prepare
+        self.waiting_for: str | None = None
+        self.wait_timer = QTimer(self, interval=250)
+        self.wait_timer.timeout.connect(self._check_waiting)
         self.bus = bus
         self.settings = settings
         self.mode = Mode.IDLE
@@ -576,7 +605,10 @@ class ShowController(QObject):
         self._place(self.audience, self.settings.audience_screen, fullscreen=not self.settings.windowed)
         if self.console:
             self._place(self.console, self.settings.console_screen, fullscreen=False)
-        QApplication.instance().installEventFilter(self)
+        app = QApplication.instance()
+        app.installEventFilter(self)
+        app.screenAdded.connect(self._screens_changed)
+        app.screenRemoved.connect(self._screens_changed)
         self.awake = system.KeepAwake()
         self.ticker.start()
         self.show_up_next()
@@ -600,11 +632,38 @@ class ShowController(QObject):
         window.raise_()
         window.activateWindow()
 
+    def _screens_changed(self, *_):
+        QTimer.singleShot(800, self._replace_windows)  # Let the OS finish rearranging first.
+
+    def _replace_windows(self):
+        """Beamer cable unplugged or plugged in mid-show: keep the console usable, slides on the beamer."""
+        if self.mode is Mode.IDLE or self.settings.windowed:
+            return
+        screens = QGuiApplication.screens()
+        console_screen = self.settings.console_screen
+        if console_screen not in screens:
+            console_screen = self.settings.console_screen = QGuiApplication.primaryScreen()
+        others = [s for s in screens if s is not console_screen]
+        if others:
+            target = self.settings.audience_screen if self.settings.audience_screen in others else others[0]
+            self.settings.audience_screen = target
+            self._place(self.audience, target, fullscreen=True)
+        elif self.console is not None:
+            # Only the laptop is left: don't cover the console with a full-screen slide.
+            self._place(self.audience, console_screen, fullscreen=False)
+        if self.console is not None:
+            self._place(self.console, console_screen, fullscreen=False)
+        self._refresh_audience_slide()
+
     def stop(self):
         if self.mode is Mode.IDLE:
             return
         self.mode = Mode.IDLE
-        QApplication.instance().removeEventFilter(self)
+        app = QApplication.instance()
+        app.removeEventFilter(self)
+        app.screenAdded.disconnect(self._screens_changed)
+        app.screenRemoved.disconnect(self._screens_changed)
+        self.wait_timer.stop()
         self.ticker.stop()
         self.countdown_timer.stop()
         self._close_talk()
@@ -640,12 +699,36 @@ class ShowController(QObject):
     def start_talk(self):
         self.countdown_timer.stop()
         item = self.items[self.index]
-        prepared = self.prepared.get(str(item.path))
-        if prepared is None or prepared.error:
-            self.audience.message.set("One moment", item.name, "Preparing…")
-            QApplication.processEvents()
+        key = str(item.path)
+        prepared = self.prepared.get(key)
+        if prepared is None or prepared.error or not is_current(item, prepared):
+            if self.request_prepare is not None:
+                # Prepared in the background (front of the line); the show stays responsive meanwhile.
+                self.waiting_for = key
+                self.request_prepare(item)
+                self.audience.message.set("One moment", item.name, "Preparing…", "S skip")
+                self.wait_timer.start()
+                self._update_console()
+                return
             prepared = prepare(item, self.settings.cache_root)
-            self.prepared[str(item.path)] = prepared
+            self.prepared[key] = prepared
+        self._begin_talk(item, prepared)
+
+    def _check_waiting(self):
+        if self.mode is not Mode.UP_NEXT or self.index >= len(self.items) \
+                or str(self.items[self.index].path) != self.waiting_for:
+            self.wait_timer.stop()  # Skipped or ended meanwhile.
+            self.waiting_for = None
+            return
+        item = self.items[self.index]
+        prepared = self.prepared.get(self.waiting_for)
+        if prepared is None or not (prepared.error or is_current(item, prepared)):
+            return
+        self.wait_timer.stop()
+        self.waiting_for = None
+        self._begin_talk(item, prepared)
+
+    def _begin_talk(self, item: Presentation, prepared: Prepared):
         if prepared.error:
             self.error = prepared.error
             self.show_up_next()
@@ -707,10 +790,17 @@ class ShowController(QObject):
     def _enter_slide(self, page: int):
         self._stop_clips()
         self.page = page
-        self._refresh_audience_slide()
         prepared = self.source.prepared
+        if prepared.kind == "image" and is_animated(prepared.path(prepared.image, self.source.item.path)):
+            self.audience.stage.set_slide(None, self.source.aspect)  # The GIF itself, not its first frame.
+            self.audience.stage.add_gif(prepared.path(prepared.image, self.source.item.path), (0, 0, 1, 1))
+        self._refresh_audience_slide()
         clips = prepared.slides[page].clips if page < len(prepared.slides) else []
         for clip in clips:
+            if clip.kind == "gif":
+                self.audience.stage.add_gif(prepared.path(clip.file, self.source.item.path),
+                                            tuple(clip.rect or (0, 0, 1, 1)))
+                continue
             video_item = self.audience.stage.add_video(tuple(clip.rect or (0, 0, 1, 1))) if clip.kind == "video" else None
             player = ClipPlayer(prepared.path(clip.file, self.source.item.path), self.bus, video_item, self)
             self.players.append(player)
@@ -724,6 +814,8 @@ class ShowController(QObject):
         if self.source is None or self.source.prepared.kind == "video":
             return
         stage = self.audience.stage
+        if self.source.prepared.kind == "image" and stage.gifs:
+            return  # An animated GIF file: the movie is the whole picture.
         rect = stage.slide_rect()
         pixmap = self.source.pixmap(self.page, int(rect.width()), int(rect.height()), stage.devicePixelRatioF())
         stage.set_slide(pixmap, self.source.aspect)
@@ -795,6 +887,8 @@ class ShowController(QObject):
                 self.end_talk()
             elif not self.settings.windowed and self.console is None:
                 self.stop()  # No console to click 'Exit show' on.
+        elif self.waiting_for is not None and key in NEXT_KEYS:
+            pass  # Already preparing it.
         elif key == Qt.Key_S and self.mode is Mode.UP_NEXT:
             self.jump_to(self.index + 1)
         elif key == Qt.Key_Home and self.mode is Mode.TALK and self.source.prepared.page_count > 1:
@@ -908,7 +1002,7 @@ class ShowController(QObject):
                 c.next_box.set_pixmap(None, f"Then: {following.name}" if following else "Then: end of show")
             slide = prepared.slides[self.page]
             c.notes.setPlainText(slide.notes or "(no notes)")
-            c.set_clips(slide.clips, self.players)
+            c.set_clips([clip for clip in slide.clips if clip.kind != "gif"], self.players)
         else:
             label = "Video playing" if prepared.kind == "video" else "Presenting in the browser"
             c.position_label.setText(f"Talk {self.index + 1} of {len(self.items)}  ·  {label}")

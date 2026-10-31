@@ -15,16 +15,16 @@ files, put them in order, press Start. Runs on **macOS, Windows and Linux**.
 
 | Files | How |
 |---|---|
-| `.pptx .ppt .pps(x) .potx .odp` | Converted to slides (PowerPoint on Windows, Keynote on Mac, else LibreOffice). Notes and embedded audio/video are kept. |
-| `.key` | Converted by Keynote, so prepare these on a Mac (see below) |
+| `.pptx .pptm .ppt .pps(x) .potx .odp` | Converted to slides (PowerPoint on Windows, Keynote on Mac, else LibreOffice). Notes, embedded audio/video and animated GIFs are kept. |
+| `.key` | Converted by Keynote on a Mac; elsewhere LibreOffice tries (older Keynote files work best, see below) |
 | `.pdf` | As is |
-| `.png .jpg .gif …` | One slide |
-| `.mp4 .mov .m4v .mkv .avi .webm` | Full-screen video, sound levelled |
+| `.png .jpg .gif …` | One slide (GIFs animate) |
+| `.mp4 .mov .m4v .mkv .avi .webm` | Full-screen video, sound levelled, iPhone (HEVC) video converted so every computer plays it |
 | `.webloc .url .gslides` (Google Slides…) | Opens in the browser; sound is *not* controlled there |
 
 **Trade-off:** slides are shown as pictures, so PowerPoint/Keynote animations and transitions
-don't play (each slide shows its final state). Audio and video on a slide do play: automatically
-if the deck says so, otherwise on the next click, just like PowerPoint.
+don't play (each slide shows its final state). Audio, video and animated GIFs on a slide do play:
+media automatically if the deck says so, otherwise on the next click, just like PowerPoint.
 
 **Slide decks are converted** by PowerPoint (Windows) or Keynote (Mac) when installed. If neither
 is there, Showrunner downloads [LibreOffice](https://www.libreoffice.org) by itself on first
@@ -86,7 +86,7 @@ Download from the repository's **Actions** tab (latest run → *Artifacts*):
   to Applications. The first time: right-click → **Open** (the app isn't notarized by Apple).
 - **Windows:** `Showrunner-Windows` → run `Showrunner-Setup.exe`. SmartScreen may warn about an
   unknown publisher → *More info* → *Run anyway*.
-- **Linux:** `Showrunner-Linux` → unpack, run `./install.sh`.
+- **Linux:** `Showrunner-linux-x86_64` or `-aarch64` (ARM) → unpack, run `./install.sh`.
 
 ### Building yourself
 

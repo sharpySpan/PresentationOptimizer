@@ -17,7 +17,7 @@ def _check(tmp: Path) -> None:
     from PySide6.QtWidgets import QApplication
 
     from . import main_window  # noqa: F401  (imports every module the app uses)
-    from . import loudness, prepare
+    from . import libreoffice, loudness, prepare
     from .library import Kind, Presentation
     from .pdf import fitz, open_pdf, render
     from .system import NO_WINDOW
@@ -42,6 +42,16 @@ def _check(tmp: Path) -> None:
                    check=True, capture_output=True, creationflags=NO_WINDOW)
     result = prepare.prepare(Presentation(clip, Kind.VIDEO), tmp / "cache")
     assert result.error is None, result.error
+
+    gif = tmp / "moving.gif"
+    subprocess.run([loudness.ffmpeg_exe(), "-hide_banner", "-nostdin", "-y", "-f", "lavfi",
+                    "-i", "testsrc=size=64x48:rate=5:duration=1", str(gif)],
+                   check=True, capture_output=True, creationflags=NO_WINDOW)
+    assert prepare.is_animated(gif), "Qt's GIF plugin is missing"
+
+    # HTTPS as the converter download does it (certificates inside the bundle).
+    with libreoffice._open(libreoffice.BASE) as response:
+        assert response.status == 200
     app.processEvents()
 
 

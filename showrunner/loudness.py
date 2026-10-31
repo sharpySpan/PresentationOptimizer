@@ -9,7 +9,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from .system import NO_WINDOW
+from . import system
 
 TARGET_LUFS = -14.0
 TRUE_PEAK = -1.5
@@ -26,9 +26,20 @@ def ffmpeg_exe() -> str:
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
-def _run(args: list[str], timeout: float = 900) -> subprocess.CompletedProcess:
-    return subprocess.run([ffmpeg_exe(), "-hide_banner", "-nostdin", *args],
-                          capture_output=True, text=True, errors="replace", timeout=timeout, creationflags=NO_WINDOW)
+def _run(args: list[str], timeout: float = 1800) -> subprocess.CompletedProcess:
+    try:
+        return system.run([ffmpeg_exe(), "-hide_banner", "-nostdin", *args], timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise MediaError(f"took longer than {timeout // 60:.0f} minutes") from exc
+    except OSError as exc:
+        raise MediaError(str(exc)) from exc
+
+
+def video_codec(path: Path) -> str | None:
+    """Codec name of the first video stream, e.g. 'h264', 'hevc', 'prores'."""
+    result = _run(["-i", str(path)], timeout=60)
+    match = re.search(r"Stream #\S+.*?: Video: (\w+)", result.stderr)
+    return match.group(1).lower() if match else None
 
 
 def measure(path: Path) -> dict | None:
@@ -56,7 +67,8 @@ def _loudnorm_filter(m: dict) -> str:
 def normalize(src: Path, dest_stem: Path, kind: str) -> Path:
     """Write a loudness-normalized copy. kind is 'audio' or 'video'. Returns the new file.
 
-    Video streams are copied untouched when possible (fast), otherwise re-encoded to H.264.
+    H.264 video is copied untouched (fast). Anything else (iPhone HEVC, ProRes, WMV, ...) is
+    re-encoded to H.264, the one codec every computer plays without extra codec packs.
     """
     m = measure(src)
     audio_args = ["-af", _loudnorm_filter(m), "-ar", "48000", "-c:a", "aac", "-b:a", "192k"] if m else ["-c:a", "aac", "-b:a", "192k"]
@@ -69,9 +81,14 @@ def normalize(src: Path, dest_stem: Path, kind: str) -> Path:
 
     dest = dest_stem.with_suffix(".mkv")
     maps = ["-map", "0:v:0", "-map", "0:a:0?"]
-    result = _run(["-y", "-i", str(src), *maps, "-c:v", "copy", *audio_args, str(dest)])
-    if result.returncode != 0:
+    result = None
+    if video_codec(src) == "h264":
+        result = _run(["-y", "-i", str(src), *maps, "-c:v", "copy", *audio_args, str(dest)])
+    if result is None or result.returncode != 0:
+        # Max 1080p: a beamer never shows more, and 4K phone video would take ages to re-encode.
         result = _run(["-y", "-i", str(src), *maps, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                       "-vf", "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:"
+                              "force_divisible_by=2",
                        "-pix_fmt", "yuv420p", *audio_args, str(dest)])
         if result.returncode != 0:
             raise MediaError(_tail(result.stderr))
@@ -80,6 +97,13 @@ def normalize(src: Path, dest_stem: Path, kind: str) -> Path:
 
 def video_frame(src: Path, dest: Path, at_seconds: float = 1.0) -> bool:
     """Grab one frame as a preview image."""
+    try:
+        return _video_frame(src, dest, at_seconds)
+    except MediaError:
+        return False
+
+
+def _video_frame(src: Path, dest: Path, at_seconds: float) -> bool:
     result = _run(["-y", "-ss", str(at_seconds), "-i", str(src), "-frames:v", "1", "-vf", "scale=640:-2", str(dest)], timeout=60)
     if result.returncode != 0 or not dest.exists():
         result = _run(["-y", "-i", str(src), "-frames:v", "1", "-vf", "scale=640:-2", str(dest)], timeout=60)

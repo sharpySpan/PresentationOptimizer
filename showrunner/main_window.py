@@ -4,9 +4,10 @@ from __future__ import annotations
 import random
 import shutil
 import threading
+import time
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QSettings, QSize, QStandardPaths, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QFileSystemWatcher, QObject, QSettings, QSize, QStandardPaths, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -23,6 +24,8 @@ from .show import ShowController, ShowSettings
 PATH_ROLE = Qt.UserRole
 NUMBER_ROLE = Qt.UserRole + 1
 THUMB = QSize(192, 108)
+SETTLE_SECONDS = 3      # A file still being copied in (USB stick, network) is left alone until it stops changing.
+COPYING = "Copying in…"
 
 
 class OrderList(QListWidget):
@@ -71,8 +74,11 @@ class OrderList(QListWidget):
                              self.placeholder)
 
 
-class ConverterDownload(QThread):
-    """Fetches LibreOffice in the background (see libreoffice.py)."""
+class ConverterDownload(QObject):
+    """Fetches LibreOffice in a background (daemon) thread (see libreoffice.py).
+
+    Not a QThread: quitting mid-download must not crash the app.
+    """
 
     progress = Signal(int, int, str)  # kB done, kB total, text
     done = Signal(str)                # error message, empty on success
@@ -81,12 +87,36 @@ class ConverterDownload(QThread):
         super().__init__(parent)
         self.cancel = threading.Event()
 
+    def start(self):
+        threading.Thread(target=self.run, name="converter-download", daemon=True).start()
+
     def run(self):
         try:
             libreoffice.install(lambda done, total, text: self.progress.emit(done >> 10, total >> 10, text), self.cancel)
             self.done.emit("")
         except Exception as exc:
             self.done.emit(str(exc) or exc.__class__.__name__)
+
+
+def _screen_id(screen) -> str:
+    """Name plus position: two identical monitors ("Generic PnP Monitor") still tell apart."""
+    g = screen.geometry()
+    return f"{screen.name()}@{g.x()},{g.y()}"
+
+
+def _readable_dir(path: Path) -> bool:
+    try:
+        next(path.iterdir(), None)
+        return True
+    except OSError:
+        return False
+
+
+def _still_copying(path: Path) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime < SETTLE_SECONDS
+    except OSError:
+        return True
 
 
 def _thumb_icon(path: Path | None, text: str = "") -> QIcon:
@@ -123,6 +153,7 @@ class MainWindow(QMainWindow):
         self.waiting_for_converter: list[Presentation] = []
         self.download: ConverterDownload | None = None
         self.download_failures = 0
+        self.need_libreoffice = False  # Set when PowerPoint/Keynote is there but fails.
         self.download_retry = QTimer(self, singleShot=True)
         self.download_retry.timeout.connect(self._ensure_converter)
 
@@ -318,19 +349,27 @@ class MainWindow(QMainWindow):
         self.bus.set_percent(s.value("volume", 100, type=int))
         self._fill_devices(s.value("audio_device", ""))
         self._fill_screens()
-        folder = Path(s.value("folder", "") or self._default_folder())
-        if not folder.is_dir():
-            folder = self._default_folder()
+        saved = s.value("folder", "")
+        folder = Path(saved) if saved and _readable_dir(Path(saved)) else self._default_folder()
         self.open_folder(folder)
         self._update_summary()
 
     @staticmethod
     def _default_folder() -> Path:
-        """Works out of the box: a folder in Documents, watched from the first launch."""
+        """Works out of the box: a folder in Documents, watched from the first launch.
+
+        If Documents is off limits (macOS privacy prompt answered "Don't Allow", Windows
+        ransomware protection), it falls back to the home folder, then the app's own data folder."""
         documents = QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation) or str(Path.home())
-        folder = Path(documents) / "Showrunner Presentations"
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
+        for base in (Path(documents), Path.home(), libreoffice.data_dir()):
+            folder = base / "Showrunner Presentations"
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                continue
+            if _readable_dir(folder):
+                return folder
+        return Path.home()
 
     def _save_settings(self):
         s = self.settings
@@ -364,8 +403,11 @@ class MainWindow(QMainWindow):
             for screen in screens:
                 g = screen.geometry()
                 label = f"{screen.name()}  ({g.width()}×{g.height()})" + ("  - main" if screen is primary else "")
-                combo.addItem(label, screen.name())
+                combo.addItem(label, _screen_id(screen))
             index = combo.findData(wanted)
+            if index < 0 and wanted:  # Saved under an older id, or the screen moved: match by name.
+                name = str(wanted).split("@")[0]
+                index = next((i for i, s in enumerate(screens) if s.name() == name), -1)
             if index < 0:
                 # Defaults: console on the main screen, beamer on the first other screen.
                 index = next((i for i, s in enumerate(screens) if (s is primary) == prefer_primary), 0)
@@ -379,7 +421,6 @@ class MainWindow(QMainWindow):
         self._save_settings()
         if self.download is not None:
             self.download.cancel.set()
-            self.download.wait(5000)
         self.worker.stop()
         super().closeEvent(event)
 
@@ -401,7 +442,12 @@ class MainWindow(QMainWindow):
         self.watcher.addPath(str(folder))
         self.prepared.clear()
         self.status.clear()
-        self.items = load_order(folder)
+        try:
+            self.items = load_order(folder)
+        except OSError as exc:
+            self.items = []
+            self.list.placeholder = (f"Showrunner isn't allowed to open\n{folder}\n\n({exc.strerror or exc})\n\n"
+                                     "Choose another folder, or allow access in your computer's privacy settings.")
         self._queue_unprepared()
         self._refresh_list()
         self._save_settings()
@@ -410,18 +456,27 @@ class MainWindow(QMainWindow):
         """New/removed files: keep the current order, add newcomers at the end."""
         if not self.folder or not self.folder.is_dir():
             return
-        save_order(self.folder, self.items)
-        self.items = load_order(self.folder)
+        try:
+            save_order(self.folder, self.items)
+            self.items = load_order(self.folder)
+        except OSError:
+            return  # e.g. a network drive that dropped out: keep what we have, try again on the next change.
         self._queue_unprepared()
         self._refresh_list()
 
     def _queue_unprepared(self):
+        settling = False
         for item in self.items:
             key = str(item.path)
-            if not item.path.exists() or key in self.status:
+            if not item.path.exists() or self.status.get(key, COPYING) != COPYING:
                 continue
             if key in self.prepared and is_current(item, self.prepared[key]):
                 continue  # A replaced file gets a new cache key, so it is prepared again.
+            if _still_copying(item.path):
+                self.status[key] = COPYING
+                settling = True
+                continue
+            self.status.pop(key, None)
             self.prepared.pop(key, None)
             cached = load_cached(item, self.cache_root)
             if cached:
@@ -433,6 +488,8 @@ class MainWindow(QMainWindow):
             else:
                 self.status[key] = "Waiting…"
                 self.worker.add(item)
+        if settling:
+            self.reload_timer.start()  # Look again once the copy has finished.
 
     def _add_files(self, paths: list[Path]):
         """Files dragged onto the list are copied into the folder, which then picks them up."""
@@ -442,10 +499,13 @@ class MainWindow(QMainWindow):
             if kind_for(path) is None or path.parent == self.folder:
                 continue
             target = self.folder / path.name
-            if path.is_dir():
-                shutil.copytree(path, target, dirs_exist_ok=True)
-            else:
-                shutil.copy2(path, target)
+            try:
+                if path.is_dir():
+                    shutil.copytree(path, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(path, target)
+            except OSError as exc:
+                QMessageBox.warning(self, "Showrunner", f"Couldn't copy {path.name} into the folder:\n{exc}")
         self.reload_folder()
 
     # --- slide converter -------------------------------------------------------
@@ -455,8 +515,12 @@ class MainWindow(QMainWindow):
         return bool(system.converter_names())
 
     def _ensure_converter(self):
-        """No PowerPoint/Keynote/LibreOffice? Fetch LibreOffice by itself, no questions asked."""
-        if self._has_converter() or self.download is not None:
+        """No PowerPoint/Keynote/LibreOffice? Fetch LibreOffice by itself, no questions asked.
+
+        Also when PowerPoint/Keynote is installed but can't convert (not activated, access denied)."""
+        if self.download is not None or "LibreOffice" in system.converter_names():
+            return
+        if self._has_converter() and not self.need_libreoffice:
             return
         self.download = ConverterDownload(self)
         self.download.progress.connect(self._on_download_progress)
@@ -477,7 +541,7 @@ class MainWindow(QMainWindow):
         self.download = None
         self.converter_bar.hide()
         system.soffice_path.cache_clear()
-        if error and not self._has_converter():
+        if error and (self.need_libreoffice or not self._has_converter()):
             self.download_failures += 1
             minutes = min(10, 2 ** (self.download_failures - 1))
             self.download_retry.start(minutes * 60_000)
@@ -511,8 +575,20 @@ class MainWindow(QMainWindow):
         self._update_row(key)
 
     def _on_prepared(self, key: str, prepared: Prepared):
-        self.prepared[key] = prepared
+        item = next((p for p in self.items if str(p.path) == key), None)
         self.status.pop(key, None)
+        if item is not None and item.path.exists() and prepared.dir and not is_current(item, prepared):
+            # Replaced while it was being prepared: do the new version.
+            self.status[key] = "Waiting…"
+            self.worker.add(item)
+            self._update_row(key)
+            return
+        self.prepared[key] = prepared
+        if (item is not None and prepared.error and needs_converter(item) and system.converter_names()
+                and "LibreOffice" not in system.converter_names()):
+            # PowerPoint/Keynote is there but failed: get LibreOffice as a second opinion.
+            self.need_libreoffice = True
+            self._ensure_converter()
         self._update_row(key)
         self._update_summary()
         if self._selected_path() == key:
@@ -675,7 +751,8 @@ class MainWindow(QMainWindow):
     # --- show ------------------------------------------------------------------
 
     def _screen(self, combo: QComboBox):
-        return next((s for s in QGuiApplication.screens() if s.name() == combo.currentData()), QGuiApplication.primaryScreen())
+        return next((s for s in QGuiApplication.screens() if _screen_id(s) == combo.currentData()),
+                    QGuiApplication.primaryScreen())
 
     def start_show(self, from_selected: bool):
         playlist = [p for p in self.items if p.enabled]
@@ -694,10 +771,18 @@ class MainWindow(QMainWindow):
             auto_start=self.auto_spin.value(),
             cache_root=self.cache_root,
         )
-        self.controller = ShowController(playlist, self.prepared, self.bus, settings, self)
+        self.controller = ShowController(playlist, self.prepared, self.bus, settings, self,
+                                         request_prepare=self._prepare_now)
         self.controller.finished.connect(lambda index: self._on_show_finished(playlist, index))
         self.hide()
         self.controller.start(start)
+
+    def _prepare_now(self, item: Presentation):
+        """The show is waiting for this one: front of the line."""
+        key = str(item.path)
+        self.prepared.pop(key, None)
+        self.status[key] = "Waiting…"
+        self.worker.add(item, urgent=True)
 
     def _on_show_finished(self, playlist: list[Presentation], index: int):
         self.controller.deleteLater()

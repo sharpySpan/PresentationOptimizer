@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 IS_MAC = sys.platform == "darwin"
@@ -17,13 +18,47 @@ IS_LINUX = sys.platform.startswith("linux")
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0
 
 
+_RUNNING: set[subprocess.Popen] = set()
+_RUNNING_LOCK = threading.Lock()
+
+
+def run(args: list[str], timeout: float, **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run that is killed on timeout and when the app quits (see kill_children)."""
+    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, errors="replace", creationflags=NO_WINDOW, **kwargs)
+    with _RUNNING_LOCK:
+        _RUNNING.add(proc)
+    try:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise
+        return subprocess.CompletedProcess(args, proc.returncode, out, err)
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING.discard(proc)
+
+
+def kill_children():
+    """On quit: stop conversions still running, so nothing keeps working in the background."""
+    with _RUNNING_LOCK:
+        procs = list(_RUNNING)
+    for proc in procs:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 class AppleScriptError(RuntimeError):
     pass
 
 
 def osascript(script: str, timeout: float = 120) -> str:
     try:
-        result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
+        result = run(["osascript", "-e", script], timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise AppleScriptError("The app did not respond in time") from exc
     if result.returncode != 0:

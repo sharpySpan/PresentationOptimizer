@@ -30,7 +30,7 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleDisplayName": "Showrunner",
             "CFBundleShortVersionString": __version__,
-            "LSMinimumSystemVersion": "11.0",
+            "LSMinimumSystemVersion": "12.0",  # Qt 6.9's minimum
             "NSHighResolutionCapable": True,
             "NSAppleEventsUsageDescription": "Showrunner asks Keynote to convert presentations before the show.",
         },

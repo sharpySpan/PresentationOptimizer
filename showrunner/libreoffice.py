@@ -90,8 +90,25 @@ def package_path(version: str, system: str | None = None, machine: str | None = 
     return f"{version}/deb/x86_64/LibreOffice_{version}_Linux_x86-64_deb.tar.gz"
 
 
+def _ssl_context():
+    """The computer's own certificate store (works behind school proxies that inspect HTTPS),
+    falling back to certifi's list. The installed app can't rely on Python's default paths."""
+    import ssl
+
+    try:
+        import truststore
+
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:  # noqa: BLE001 - very old OS, or truststore missing
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+
+
 def _open(url: str, timeout: float = 30):
-    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT}), timeout=timeout)
+    # urllib picks up the system proxy settings (Windows/macOS settings, http(s)_proxy on Linux).
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    return urllib.request.urlopen(request, timeout=timeout, context=_ssl_context())
 
 
 def install(progress=lambda done, total, text: None, cancel: threading.Event | None = None) -> Path:

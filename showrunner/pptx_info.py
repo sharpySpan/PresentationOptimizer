@@ -1,10 +1,11 @@
-"""Reads what we need out of a .pptx: speaker notes and the audio/video on each slide.
+"""Reads what we need out of a .pptx: speaker notes, audio/video and animated GIFs on each slide.
 
 Plain zipfile + ElementTree, so it works the same on every platform.
 """
 from __future__ import annotations
 
 import posixpath
+import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
 from xml.etree import ElementTree
@@ -26,7 +27,7 @@ VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".wmv", ".avi", ".mkv", ".webm", ".m
 
 @dataclass
 class MediaRef:
-    kind: str                 # "audio" or "video"
+    kind: str                 # "audio", "video" or "gif"
     part: str | None          # path inside the zip when embedded
     external: str | None      # file name when only linked (the classic "no sound on the day")
     rect: tuple[float, float, float, float] | None  # x, y, w, h as fractions of the slide
@@ -45,8 +46,19 @@ class DeckInfo:
     aspect: float                # width / height
 
 
+# "Strict Open XML" (a Save As option in PowerPoint) uses other namespaces for the same elements.
+STRICT = {
+    b"http://purl.oclc.org/ooxml/presentationml/main": NS["p"].encode(),
+    b"http://purl.oclc.org/ooxml/drawingml/main": NS["a"].encode(),
+    b"http://purl.oclc.org/ooxml/officeDocument/relationships": NS["r"].encode(),
+}
+
+
 def _xml(zf: zipfile.ZipFile, part: str):
-    return ElementTree.fromstring(zf.read(part))
+    data = zf.read(part)
+    for strict, transitional in STRICT.items():
+        data = data.replace(strict, transitional)
+    return ElementTree.fromstring(data)
 
 
 def _rels(zf: zipfile.ZipFile, part: str) -> dict[str, tuple[str, bool]]:
@@ -120,15 +132,64 @@ def read_deck(path) -> DeckInfo:
                 if target.endswith(".xml") and "/notesSlides/" in target and target in zf.namelist():
                     info.notes = _notes_text(zf, target)
             autoplay = _autoplay_shape_ids(slide)
-            for pic in slide.iter(f"{{{NS['p']}}}pic"):
-                media = _media_for_pic(pic, rels, cx, cy, autoplay)
+            tree = slide.find("p:cSld/p:spTree", NS)
+            for pic, place in _pictures(tree, IDENTITY) if tree is not None else ():
+                media = _media_for_pic(pic, rels, cx, cy, autoplay, place)
                 if media:
                     info.media.append(media)
             slides.append(info)
         return DeckInfo(slides, cx / cy if cy else 16 / 9)
 
 
-def _media_for_pic(pic, rels, cx, cy, autoplay_ids) -> MediaRef | None:
+IDENTITY = (0.0, 0.0, 1.0, 1.0)  # slide x = ox + x * sx (EMU), same for y
+
+
+def _pictures(tree, place):
+    """Every p:pic in show order, with the transform of the groups it sits in."""
+    for child in tree:
+        if child.tag == f"{{{NS['p']}}}pic":
+            yield child, place
+        elif child.tag == f"{{{NS['p']}}}grpSp":
+            xfrm = child.find("p:grpSpPr/a:xfrm", NS)
+            inner = place
+            if xfrm is not None:
+                off, ext = xfrm.find("a:off", NS), xfrm.find("a:ext", NS)
+                ch_off, ch_ext = xfrm.find("a:chOff", NS), xfrm.find("a:chExt", NS)
+                if None not in (off, ext, ch_off, ch_ext):
+                    gsx = int(ext.get("cx", 0)) / max(1, int(ch_ext.get("cx", 1)))
+                    gsy = int(ext.get("cy", 0)) / max(1, int(ch_ext.get("cy", 1)))
+                    gox = int(off.get("x", 0)) - int(ch_off.get("x", 0)) * gsx
+                    goy = int(off.get("y", 0)) - int(ch_off.get("y", 0)) * gsy
+                    ox, oy, sx, sy = place
+                    inner = (ox + gox * sx, oy + goy * sy, sx * gsx, sy * gsy)
+            yield from _pictures(child, inner)
+        elif child.tag.endswith("}AlternateContent"):
+            choice = next(iter(child), None)  # mc:Choice: what current PowerPoint shows
+            if choice is not None:
+                yield from _pictures(choice, place)
+
+
+def _rect(pic, cx, cy, place):
+    off = pic.find("p:spPr/a:xfrm/a:off", NS)
+    ext = pic.find("p:spPr/a:xfrm/a:ext", NS)
+    if off is None or ext is None or not cx or not cy:
+        return None
+    ox, oy, sx, sy = place
+    return ((ox + int(off.get("x", 0)) * sx) / cx, (oy + int(off.get("y", 0)) * sy) / cy,
+            int(ext.get("cx", 0)) * sx / cx, int(ext.get("cy", 0)) * sy / cy)
+
+
+def _gif_for_pic(pic, rels, cx, cy, place) -> MediaRef | None:
+    """A picture that is a GIF: every PDF export freezes it, so the show plays it on top."""
+    blip = pic.find("p:blipFill/a:blip", NS)
+    rid = blip.get(R_EMBED) if blip is not None else None
+    target, external = rels.get(rid, (None, True)) if rid else (None, True)
+    if external or not target or not target.lower().endswith(".gif"):
+        return None
+    return MediaRef("gif", target, None, _rect(pic, cx, cy, place), True)
+
+
+def _media_for_pic(pic, rels, cx, cy, autoplay_ids, place=IDENTITY) -> MediaRef | None:
     nvpr = pic.find("p:nvPicPr/p:nvPr", NS)
     if nvpr is None:
         return None
@@ -139,7 +200,7 @@ def _media_for_pic(pic, rels, cx, cy, autoplay_ids) -> MediaRef | None:
         tag_kind = "audio"
     p14 = nvpr.find(".//p14:media", NS)
     if tag is None and p14 is None:
-        return None
+        return _gif_for_pic(pic, rels, cx, cy, place)
 
     part = external = None
     # The p14:media element points at the embedded copy; a:videoFile may only be a link.
@@ -147,19 +208,15 @@ def _media_for_pic(pic, rels, cx, cy, autoplay_ids) -> MediaRef | None:
         if rid and rid in rels:
             target, is_external = rels[rid]
             if is_external:
-                external = external or posixpath.basename(target.replace("\\", "/"))
+                # 'file:///C:/Users/kid/My%20Movie.mp4' -> 'My Movie.mp4'
+                external = external or posixpath.basename(urllib.parse.unquote(target).replace("\\", "/"))
             else:
                 part = target
                 break
     if part is None and external is None:
         return None
 
-    rect = None
-    off = pic.find("p:spPr/a:xfrm/a:off", NS)
-    ext = pic.find("p:spPr/a:xfrm/a:ext", NS)
-    if off is not None and ext is not None and cx and cy:
-        rect = (int(off.get("x", 0)) / cx, int(off.get("y", 0)) / cy, int(ext.get("cx", 0)) / cx, int(ext.get("cy", 0)) / cy)
-
+    rect = _rect(pic, cx, cy, place)
     cnv = pic.find("p:nvPicPr/p:cNvPr", NS)
     shape_id = cnv.get("id") if cnv is not None else None
     kind = _kind_for(part or external, tag_kind)

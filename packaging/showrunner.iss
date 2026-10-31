@@ -11,7 +11,8 @@ AppPublisher=Showrunner
 DefaultDirName={autopf}\Showrunner
 DefaultGroupName=Showrunner
 DisableProgramGroupPage=yes
-PrivilegesRequiredOverridesAllowed=dialog
+; Per-user install: no admin password needed (school laptops).
+PrivilegesRequired=lowest
 OutputDir=..\dist
 OutputBaseFilename=Showrunner-Setup
 Compression=lzma2

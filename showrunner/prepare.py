@@ -4,6 +4,7 @@ For each file we produce, in a cache folder:
   - slides.pdf          what goes on the beamer
   - notes + media list  from the .pptx
   - clipN.m4a / .mkv    every audio/video clip, loudness-normalized to the same level
+  - gifN.gif            animated GIFs (frozen in any PDF), played on top of the slide
   - thumb.png           preview for the set-up screen
 
 The cache lives in '<folder>/.showrunner/' when the folder is writable, so a folder prepared
@@ -11,9 +12,9 @@ on one computer is ready on the next.
 """
 from __future__ import annotations
 
+import collections
 import hashlib
 import json
-import queue
 import shutil
 import tempfile
 import threading
@@ -21,12 +22,12 @@ import zipfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QThread, Signal
+from PySide6.QtCore import QObject, Signal
 
-from . import convert, loudness, pptx_info
-from .library import DECK_KINDS, Kind, Presentation, paired_pdf, resolve_web_url
+from . import convert, loudness, pptx_info, system
+from .library import DECK_KINDS, Kind, Presentation, fresh_paired_pdf, paired_pdf, resolve_web_url
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_DIRNAME = ".showrunner"
 SOURCE = "@source"  # Placeholder for "the original file", so caches survive moving the folder.
 
@@ -34,8 +35,8 @@ SOURCE = "@source"  # Placeholder for "the original file", so caches survive mov
 @dataclass
 class Clip:
     file: str
-    kind: str                                   # "audio" / "video"
-    rect: list[float] | None = None             # x, y, w, h as slide fractions (video)
+    kind: str                                   # "audio" / "video" / "gif"
+    rect: list[float] | None = None             # x, y, w, h as slide fractions (video, gif)
     autoplay: bool = False
 
 
@@ -86,9 +87,18 @@ def is_current(item: Presentation, prepared: Prepared) -> bool:
         return False
 
 
+CLOUD_FOLDERS = ("onedrive", "dropbox", "google drive", "googledrive", "mobile documents", "icloud")
+
+
+def _in_cloud_folder(path: Path) -> bool:
+    """OneDrive/iCloud/Dropbox would upload hundreds of MB of prepared clips: keep the cache local there."""
+    return any(part.casefold().startswith(CLOUD_FOLDERS) for part in path.parts)
+
+
 def cache_dir(item: Presentation, fallback_root: Path) -> Path:
     key = cache_key(item)
-    for root in (item.path.parent / CACHE_DIRNAME, fallback_root):
+    roots = [fallback_root] if _in_cloud_folder(item.path.parent) else [item.path.parent / CACHE_DIRNAME, fallback_root]
+    for root in roots:
         try:
             target = root / key
             target.mkdir(parents=True, exist_ok=True)
@@ -124,24 +134,23 @@ def prepare(item: Presentation, fallback_root: Path, progress=lambda text: None)
     try:
         if item.kind is Kind.PDF:
             _prepare_pdf(item, result, item.path, None, progress)
-        elif item.kind in DECK_KINDS and paired_pdf(item.path):
+        elif item.kind in DECK_KINDS and fresh_paired_pdf(item.path):
             # The student also exported a PDF: it looks exactly like their own app, no converter needed.
-            shutil.copyfile(paired_pdf(item.path), folder / "slides.pdf")
-            deck_src = item.path if zipfile.is_zipfile(item.path) and item.kind is Kind.POWERPOINT else None
-            _prepare_pdf(item, result, folder / "slides.pdf", deck_src, progress)
+            _use_paired_pdf(item, result, folder, fresh_paired_pdf(item.path), progress)
         elif item.kind in DECK_KINDS:
             progress("Converting slides…")
             with tempfile.TemporaryDirectory(prefix="showrunner-") as tmp:
-                pdf, pptx = convert.convert(item.path, Path(tmp))
-                shutil.copyfile(pdf, folder / "slides.pdf")
-                deck_src = None
-                if pptx is not None:
-                    deck_src = folder / "deck-source.pptx" if pptx != item.path else item.path
-                    if pptx != item.path:
-                        shutil.copyfile(pptx, deck_src)
-                _prepare_pdf(item, result, folder / "slides.pdf", deck_src, progress)
-                if deck_src is not None and deck_src != item.path:
-                    deck_src.unlink(missing_ok=True)
+                try:
+                    pdf, pptx = convert.convert(item.path, Path(tmp))
+                except convert.ConvertError:
+                    stale = paired_pdf(item.path)
+                    if stale is None:
+                        raise
+                    # The deck was edited after its PDF export and won't convert: an older PDF beats nothing.
+                    _use_paired_pdf(item, result, folder, stale, progress)
+                    result.warnings.append(f"{stale.name} is older than {item.path.name}: showing the older PDF.")
+                    return result  # Not cached: converted properly once a converter works.
+                _use_converted(item, result, folder, pdf, pptx, progress)
         elif item.kind is Kind.IMAGE:
             result.kind = "image"
             result.image = SOURCE
@@ -154,7 +163,7 @@ def prepare(item: Presentation, fallback_root: Path, progress=lambda text: None)
             progress("Levelling sound…")
             try:
                 result.video = loudness.normalize(item.path, folder / "video", "video").name
-            except loudness.MediaError as exc:
+            except (loudness.MediaError, OSError) as exc:
                 result.video = SOURCE
                 result.warnings.append(f"Sound could not be levelled ({exc}); plays as-is.")
             if loudness.video_frame(item.path, folder / "thumb.png"):
@@ -175,6 +184,24 @@ def prepare(item: Presentation, fallback_root: Path, progress=lambda text: None)
     data["version"] = CACHE_VERSION
     (folder / "manifest.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
     return result
+
+
+def _use_paired_pdf(item: Presentation, result: Prepared, folder: Path, pdf: Path, progress):
+    shutil.copyfile(pdf, folder / "slides.pdf")
+    deck_src = item.path if item.kind is Kind.POWERPOINT and zipfile.is_zipfile(item.path) else None
+    _prepare_pdf(item, result, folder / "slides.pdf", deck_src, progress)
+
+
+def _use_converted(item: Presentation, result: Prepared, folder: Path, pdf: Path, pptx: Path | None, progress):
+    shutil.copyfile(pdf, folder / "slides.pdf")
+    deck_src = None
+    if pptx is not None:
+        deck_src = folder / "deck-source.pptx" if pptx != item.path else item.path
+        if pptx != item.path:
+            shutil.copyfile(pptx, deck_src)
+    _prepare_pdf(item, result, folder / "slides.pdf", deck_src, progress)
+    if deck_src is not None and deck_src != item.path:
+        deck_src.unlink(missing_ok=True)
 
 
 def _prepare_pdf(item: Presentation, result: Prepared, pdf_path: Path, deck_path: Path | None, progress):
@@ -212,19 +239,36 @@ def _prepare_pdf(item: Presentation, result: Prepared, pdf_path: Path, deck_path
             slide.notes = info.notes
             for media in info.media:
                 clip_no += 1
-                source = _media_source(zf, media, item.path.parent, folder, clip_no, result)
-                if source is None:
-                    continue
-                progress(f"Levelling sound ({clip_no})…")
                 try:
-                    out = loudness.normalize(source, folder / f"clip{clip_no}", media.kind)
-                    if source.parent == folder:
-                        source.unlink(missing_ok=True)  # Raw extract no longer needed.
-                except loudness.MediaError as exc:
-                    result.warnings.append(f"Slide {index + 1}: sound could not be levelled ({exc}).")
-                    out = source
-                slide.clips.append(Clip(out.name if out.parent == folder else str(out), media.kind,
-                                        list(media.rect) if media.rect else None, media.autoplay))
+                    clip = _prepare_media(zf, media, item, result, folder, clip_no, progress)
+                except Exception as exc:  # noqa: BLE001 - one broken clip must not sink the whole talk
+                    result.warnings.append(f"Slide {index + 1}: a {media.kind} on this slide can't be played ({exc}).")
+                    continue
+                if clip is not None:
+                    slide.clips.append(clip)
+
+
+def _prepare_media(zf, media, item: Presentation, result: Prepared, folder: Path, n: int, progress) -> Clip | None:
+    rect = list(media.rect) if media.rect else None
+    if media.kind == "gif":
+        gif = folder / f"gif{n}.gif"
+        gif.write_bytes(zf.read(media.part))
+        if is_animated(gif):
+            return Clip(gif.name, "gif", rect, True)
+        gif.unlink()  # A still GIF already looks right in the PDF.
+        return None
+    source = _media_source(zf, media, item.path.parent, folder, n, result)
+    if source is None:
+        return None
+    progress(f"Levelling sound ({n})…")
+    try:
+        out = loudness.normalize(source, folder / f"clip{n}", media.kind)
+        if source.parent == folder:
+            source.unlink(missing_ok=True)  # Raw extract no longer needed.
+    except loudness.MediaError as exc:
+        result.warnings.append(f"A {media.kind} could not be levelled ({exc}); it plays as-is.")
+        out = source
+    return Clip(out.name if out.parent == folder else str(out), media.kind, rect, media.autoplay)
 
 
 def _media_source(zf, media, source_folder: Path, folder: Path, n: int, result: Prepared) -> Path | None:
@@ -238,6 +282,12 @@ def _media_source(zf, media, source_folder: Path, folder: Path, n: int, result: 
         return candidate
     result.warnings.append(f"'{media.external}' is linked, not embedded: that sound/video is missing.")
     return None
+
+
+def is_animated(path: Path) -> bool:
+    from PySide6.QtGui import QImageReader
+
+    return QImageReader(str(path)).imageCount() > 1
 
 
 def _fit(rect, width: int):
@@ -257,8 +307,18 @@ def _image_thumb(src: Path, dest: Path):
     image.scaledToWidth(480, Qt.SmoothTransformation).save(str(dest))
 
 
-class PrepareWorker(QThread):
-    """Prepares items one by one in the background, newest requests first in line."""
+def worker_count() -> int:
+    """Parallel preparations: each LibreOffice/ffmpeg job mostly uses one core and some memory."""
+    import os
+
+    return max(2, min(4, (os.cpu_count() or 2) // 2))
+
+
+class PrepareWorker(QObject):
+    """Prepares items in background threads, several at once, in the order they were added.
+
+    Plain Python threads (daemon), not QThreads: quitting mid-conversion can't crash the app.
+    """
 
     progress = Signal(str, str)      # path, status text
     prepared = Signal(str, object)   # path, Prepared
@@ -266,28 +326,48 @@ class PrepareWorker(QThread):
     def __init__(self, fallback_root: Path, parent=None):
         super().__init__(parent)
         self.fallback_root = fallback_root
-        self.queue: queue.Queue[Presentation | None] = queue.Queue()
-        self._stopping = threading.Event()
+        self._queue: collections.deque[Presentation] = collections.deque()
+        self._wake = threading.Condition()
+        self._stopping = False
+        self._locks: dict[str, threading.Lock] = {}
 
-    def add(self, item: Presentation):
-        self.queue.put(item)
+    def start(self):
+        for n in range(worker_count()):
+            threading.Thread(target=self._serve, name=f"prepare-{n}", daemon=True).start()
+
+    def add(self, item: Presentation, urgent: bool = False):
+        """urgent: the show is waiting for this one, so it goes to the front of the line."""
+        with self._wake:
+            (self._queue.appendleft if urgent else self._queue.append)(item)
+            self._wake.notify()
 
     def stop(self):
-        self._stopping.set()
-        self.queue.put(None)
-        self.wait(3000)
+        with self._wake:
+            self._stopping = True
+            self._queue.clear()
+            self._wake.notify_all()
+        system.kill_children()
 
-    def run(self):
-        while not self._stopping.is_set():
-            item = self.queue.get()
-            if item is None:
-                break
-            if not item.path.exists():
-                continue
+    def _next(self) -> Presentation | None:
+        with self._wake:
+            while not self._queue and not self._stopping:
+                self._wake.wait()
+            return None if self._stopping else self._queue.popleft()
+
+    def _serve(self):
+        while (item := self._next()) is not None:
             key = str(item.path)
-            self.progress.emit(key, "Preparing…")
-            try:
-                result = prepare(item, self.fallback_root, lambda text: self.progress.emit(key, text))
-            except Exception as exc:
-                result = Prepared(kind="slides", error=str(exc))
-            self.prepared.emit(key, result)
+            # The same file queued twice (it changed again) never runs twice at once: same cache folder.
+            with self._wake:
+                lock = self._locks.setdefault(key, threading.Lock())
+            with lock:
+                if not item.path.exists():
+                    result = Prepared(kind="slides", error="The file was removed from the folder")
+                else:
+                    self.progress.emit(key, "Preparing…")
+                    try:
+                        result = prepare(item, self.fallback_root, lambda text: self.progress.emit(key, text))
+                    except Exception as exc:  # noqa: BLE001 - shown on that file's row
+                        result = Prepared(kind="slides", error=str(exc) or exc.__class__.__name__)
+            if not self._stopping:
+                self.prepared.emit(key, result)
