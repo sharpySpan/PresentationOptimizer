@@ -15,6 +15,11 @@ Back-to-back presentations without the set-up time: one folder, put the files in
 
 **Nothing to set up.** Install, open, and put the presentations in *Documents → Showrunner Presentations* (or drag them onto the list). If the computer has no PowerPoint or Keynote, Showrunner downloads the free LibreOffice converter by itself the first time it starts (~350 MB, one time only, no admin rights needed).
 
+## New in 1.1.2
+- Fixed: "No such file or directory … pymupdf/layout/…" when preparing presentations in the installed app
+- Every installer is now started and run through a real self-test before it's published
+- Unexpected errors show a message and are saved to `showrunner.log` instead of failing silently
+
 ## What it does
 - Zero set-up: watched folder, slide converter fetched automatically, screens picked automatically
 - `Name.pptx` + `Name.pdf`: the PDF is shown (looks exactly like the original), notes and sound come from the .pptx

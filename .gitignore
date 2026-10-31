@@ -8,3 +8,4 @@ dist/
 .DS_Store
 .showrunner/
 ci-output.log
+selftest-report.txt
