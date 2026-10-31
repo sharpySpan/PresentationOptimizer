@@ -3,6 +3,7 @@ name: Build installers
 on:
   push:
     branches: [main]
+    tags: ["v*"]   # Pushing a tag like v1.0.0 also publishes a GitHub release.
   workflow_dispatch:
 
 jobs:
@@ -84,3 +85,28 @@ jobs:
         with:
           name: Showrunner-Linux
           path: dist/Showrunner-linux-*.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect files
+        run: |
+          mkdir release
+          cp artifacts/Showrunner-macOS-arm64/Showrunner.dmg release/Showrunner-macOS-AppleSilicon.dmg
+          cp artifacts/Showrunner-macOS-x86_64/Showrunner.dmg release/Showrunner-macOS-Intel.dmg
+          cp artifacts/Showrunner-Windows/Showrunner-Setup.exe release/Showrunner-Windows-Setup.exe
+          cp artifacts/Showrunner-Linux/*.tar.gz release/
+          ls -l release
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release/* --title "Showrunner $GITHUB_REF_NAME" --notes-file packaging/release-notes.md
