@@ -19,8 +19,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -33,7 +33,7 @@ jobs:
         run: PYTHON=python bash packaging/build_mac.sh
       - name: Self-test the built app
         run: bash packaging/ci_run.sh bash packaging/ci_selftest.sh dist/Showrunner.app/Contents/MacOS/Showrunner
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: Showrunner-macOS-${{ matrix.arch }}
           path: dist/Showrunner.dmg
@@ -42,8 +42,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install dependencies
@@ -60,7 +60,7 @@ jobs:
       - name: Self-test the built app
         shell: bash
         run: bash packaging/ci_run.sh bash packaging/ci_selftest.sh dist/Showrunner/Showrunner.exe
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: Showrunner-Windows
           path: dist/Showrunner-Setup.exe
@@ -74,8 +74,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: System libraries for Qt
@@ -93,7 +93,7 @@ jobs:
         run: PYTHON=python bash packaging/build_linux.sh
       - name: Self-test the built app
         run: bash packaging/ci_run.sh bash packaging/ci_selftest.sh dist/Showrunner/Showrunner
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: Showrunner-Linux-${{ matrix.runner }}
           path: dist/Showrunner-linux-*.tar.gz
@@ -107,15 +107,15 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: System libraries
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxinerama1 libnss3 libcairo2 libcups2 libglib2.0-0 libdbus-1-3 libxrandr2 libsm6
+          sudo apt-get install -y libxinerama1 libnss3 libcairo2 libcups2 libglib2.0-0 libdbus-1-3 libxrandr2 libsm6 \n            libegl1 libgl1 libxkbcommon0 libfontconfig1
       - name: Install dependencies
         shell: bash
         run: pip install -r requirements.txt python-pptx pytest
@@ -133,8 +133,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
         with:
           path: artifacts
       - name: Collect files
