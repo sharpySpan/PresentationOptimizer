@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Showrunner
+Comment=Back-to-back presentations without the set-up time
+Exec=@EXEC@
+Terminal=false
+Categories=Office;Presentation;

@@ -1,10 +1,8 @@
 import json
 import plistlib
-import zipfile
 
-from showrunner import checks
 from showrunner.library import (
-    ORDER_FILE, Kind, Presentation, display_name, kind_for, load_order, resolve_web_url, save_order, scan_folder,
+    ORDER_FILE, Kind, display_name, kind_for, load_order, resolve_web_url, save_order, scan_folder,
 )
 
 
@@ -68,34 +66,3 @@ def test_web_shortcuts(tmp_path):
     gslides = tmp_path / "c.gslides"
     gslides.write_text(json.dumps({"doc_id": "xyz"}))
     assert resolve_web_url(gslides) == "https://docs.google.com/presentation/d/xyz/present"
-
-
-def make_pptx(path, media=(), external=()):
-    rels = "".join(
-        f'<Relationship Id="r{i}" Type="t" Target="{t}" TargetMode="External"/>' for i, t in enumerate(external)
-    )
-    with zipfile.ZipFile(path, "w") as zf:
-        zf.writestr("ppt/presentation.xml", "<p/>")
-        for name in media:
-            zf.writestr(f"ppt/media/{name}", b"x")
-        zf.writestr("ppt/slides/_rels/slide1.xml.rels", f'<Relationships xmlns="r">{rels}</Relationships>')
-
-
-def test_embedded_media_warnings(tmp_path):
-    good = tmp_path / "good.pptx"
-    make_pptx(good, media=["song.mp3"])
-    assert checks._embedded_media(Presentation(good, Kind.POWERPOINT)) == (1, [])
-
-    bad = tmp_path / "bad.pptx"
-    make_pptx(bad, media=["clip.wmv"], external=["file:///C:/Users/me/Music/intro.mp3"])
-    count, warnings = checks._embedded_media(Presentation(bad, Kind.POWERPOINT))
-    assert count == 1
-    assert any(".wmv" in w for w in warnings)
-    assert any("intro.mp3" in w for w in warnings)
-
-
-def test_check_missing_and_empty(tmp_path):
-    empty = tmp_path / "e.pdf"
-    empty.write_bytes(b"")
-    assert checks.check(Presentation(empty, Kind.PDF), "keynote").level == checks.ERROR
-    assert checks.check(Presentation(tmp_path / "gone.pdf", Kind.PDF), "keynote").level == checks.ERROR

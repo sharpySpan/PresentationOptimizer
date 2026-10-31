@@ -1,82 +1,99 @@
 # Showrunner
 
 Back-to-back presentations without the set-up time. Point it at one folder with everyone's
-files, put them in order, press Start. Between talks it shows an **Up next: name** screen; the next
-presenter presses their clicker and their deck starts.
+files, put them in order, press Start. Runs on **macOS, Windows and Linux**.
+
+- **Two screens.** The beamer shows only the slides. The monitor gets a console with the current
+  and next slide, **speaker notes**, a talk timer, the running order and all sound controls.
+- **Same loudness for everyone.** Every audio and video clip is levelled to the same loudness
+  (EBU R128, -14 LUFS) while preparing. One master slider goes **0% to 200%**. **Alt+S** mutes.
+- **Prepared ahead.** As soon as you pick the folder, every file is converted in the background:
+  slides, notes, sound and a preview thumbnail. During the show, switching speakers is instant.
 
 ## What it plays
 
-| Files | Played by |
+| Files | How |
 |---|---|
-| `.key` | Keynote |
-| `.pptx .ppt .pptm .ppsx .pps .potx` | Keynote (default) or PowerPoint, your choice |
-| `.odp` | Converted with LibreOffice, then Keynote/PowerPoint |
-| `.pdf` | Built-in full-screen viewer |
-| `.png .jpg .gif .heic …` | Built-in (one slide) |
-| `.mp4 .mov .m4v` | Built-in video player, with sound |
-| `.webloc .url .gslides` (Google Slides, Canva links…) | Opens in the browser in present mode |
+| `.pptx .ppt .pps(x) .potx .odp` | Converted to slides (PowerPoint on Windows, Keynote on Mac, else LibreOffice). Notes and embedded audio/video are kept. |
+| `.key` | Converted by Keynote, so prepare these on a Mac (see below) |
+| `.pdf` | As is |
+| `.png .jpg .gif …` | One slide |
+| `.mp4 .mov .m4v .mkv .avi .webm` | Full-screen video, sound levelled |
+| `.webloc .url .gslides` (Google Slides…) | Opens in the browser; sound is *not* controlled there |
 
-When a Keynote/PowerPoint slideshow ends (last slide or Esc), Showrunner closes the file without
-saving and takes the screen back for the next person.
+**Trade-off:** slides are shown as pictures, so PowerPoint/Keynote animations and transitions
+don't play (each slide shows its final state). Audio and video on a slide do play: automatically
+if the deck says so, otherwise on the next click, just like PowerPoint.
 
-## Sound
-
-- Pick the output (HDMI/projector, USB speaker, AirPlay…) once. It's applied to the **system**
-  output, which is what Keynote and PowerPoint use.
-- Volume is set and mute is switched off **before every talk**, so an HDMI reconnect or a
-  student muting the Mac doesn't kill the next video.
-- **Play test sound** plays a chime left, then right.
-- **Check all files** flags decks that will lose sound: audio/video that's *linked* rather than
-  embedded (the file is on the student's own laptop), and Windows-only formats like `.wma`/`.wmv`.
+**Converter needed for slide decks:** PowerPoint (Windows), Keynote (Mac) or the free
+[LibreOffice](https://www.libreoffice.org) (any OS). The set-up screen says which one it found.
 
 ## Using it
 
-1. Open Showrunner, **Choose folder…**.
-2. Drag to reorder, or Sort A–Z / Shuffle. Untick anyone who's absent. The order is saved in the
-   folder (`.showrunner-order.json`); files added later show up at the bottom by themselves.
-3. Choose the screen to present on, press **Start the show**.
+1. **Choose folder…**. Every file appears with a preview and its status: slides, audio/video,
+   notes, or a warning.
+2. Put them in order: drag, the ▲▼ buttons, or *Sort by name / date / random*. Untick anyone
+   who's absent. The order is saved in the folder.
+3. Under *Show*, choose which screen is the **Beamer** and which is the **Console**.
+   *Test mode* runs both as normal windows, handy for trying it on one laptop.
+4. Click **Test sound**, pick the output (HDMI, speaker…), set the level, and press **Start the show**.
 
-During the show: **→ / Space / clicker** = next · **←** = previous · **S** = skip · **Esc** = end
-this talk (or leave the show from the Up next screen). Optional *Auto-start next* counts down
-and starts the next talk by itself.
+Files added to the folder later appear at the bottom and get prepared automatically.
 
-## First-run checklist on the presentation Mac
+### Keys (work in both windows; clickers work too)
 
-- macOS asks *"Showrunner wants to control Keynote / PowerPoint"*: click **OK** (System Settings →
-  Privacy & Security → Automation if you missed it).
-- Keynote → Settings → Slideshow: choose the projector under *Present on display*, and enable
-  *Exit presentation after last slide*.
-- PowerPoint (if used) may ask to **Grant access** to the folder once. Select the folder itself.
-- Turn on Do Not Disturb so notifications don't pop up on the projector.
-- Do a dry run with **Check all files** the day before.
+| Key | Does |
+|---|---|
+| → ↓ Space PageDown Enter | Next slide / play the clip on this slide / start the next talk |
+| ← ↑ PageUp | Previous slide (or previous presenter on the *Up next* screen) |
+| **Alt+S** (or M) | Mute / unmute |
+| Alt+↑ / Alt+↓ (or + / −) | Volume ±10% |
+| B or . | Black screen |
+| Esc | End this talk |
+| S | Skip this presenter (on *Up next*) |
+
+### Sound levels
+
+100% plays the levelled audio at half amplitude, and 200% at full. That leaves room to go louder
+without distortion. Set the speaker/amp volume once so 100% sounds right in the room.
+
+Decks warn you about *linked* audio/video (the file stayed on the student's laptop). If the
+student also puts that file in the folder, Showrunner finds and uses it.
+
+### Prepared files
+
+Prepared material goes in a hidden `.showrunner` folder inside the presentations folder.
+Prepare once on a Mac (for `.key` files) and the same folder is ready on Windows/Linux.
 
 ## Install
 
-Download `Showrunner.dmg`, open it, drag **Showrunner** to Applications. The app isn't notarized
-by Apple, so the first time: right-click it → **Open** → **Open**.
+Download from the repository's **Actions** tab (latest run → *Artifacts*):
 
-### Building the .dmg
+- **macOS:** `Showrunner-macOS-arm64` (M1 and newer) or `-x86_64` (Intel). Open the `.dmg`, drag
+  to Applications. The first time: right-click → **Open** (the app isn't notarized by Apple).
+- **Windows:** `Showrunner-Windows` → run `Showrunner-Setup.exe`. SmartScreen may warn about an
+  unknown publisher → *More info* → *Run anyway*.
+- **Linux:** `Showrunner-Linux` → unpack, run `./install.sh`.
 
-On a Mac (Python 3.10+):
+### Building yourself
 
 ```bash
-bash packaging/build_mac.sh
+bash packaging/build_mac.sh            # macOS -> dist/Showrunner.dmg
+bash packaging/build_linux.sh          # Linux -> dist/Showrunner-linux-*.tar.gz
 ```
 
-Produces `dist/Showrunner.app` and `dist/Showrunner.dmg`. Builds are per-architecture; build on
-an Apple Silicon Mac for M-series Macs.
+Windows (needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) for the installer):
 
-No Mac at hand? Push this repo to GitHub: `.github/workflows/build-mac.yml` builds the `.dmg`
-for Apple Silicon and Intel and attaches it to the workflow run (Actions tab → run → Artifacts).
+```powershell
+.\packaging\build_windows.ps1
+```
 
 ## Running from source
 
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python run_showrunner.py
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt     # Windows: .venv\Scripts\pip
+.venv/bin/python run_showrunner.py
 ```
 
-Tests: `pip install pytest && python -m pytest`. On Windows/Linux the app runs too (handy for
-testing the ordering screen and PDFs), but Keynote/PowerPoint playback and output-device
-switching are macOS-only.
+Tests: `pip install pytest`, then `python -m pytest`.

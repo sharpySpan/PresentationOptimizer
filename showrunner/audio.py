@@ -1,201 +1,135 @@
-"""Making sure sound comes out of the right speakers.
+"""One sound control for the whole show.
 
-On macOS this talks to CoreAudio directly (via ctypes) to pick the system output device,
-because Keynote and PowerPoint always play through the system default output. Volume and
-mute go through AppleScript.
+Every clip is loudness-normalized while preparing (see loudness.py), and every player gets its
+QAudioOutput from this bus. That gives:
+  - the same level across all talks,
+  - one master slider from 0% to 200%,
+  - one mute (Alt+S),
+  - one output device (HDMI, USB speaker, ...).
+
+To make 200% possible without distortion, 100% plays normalized audio at half amplitude
+(-6 dB) and 200% plays it at full scale. Set the speakers/amp once so 100% sounds right.
 """
 from __future__ import annotations
 
-import ctypes
 import math
 import struct
-import subprocess
 import tempfile
 import wave
-from ctypes import POINTER, byref, c_uint32, c_void_p, sizeof
+import weakref
 from pathlib import Path
 
-from . import macos
+from PySide6.QtCore import QObject, QUrl, Signal
+from PySide6.QtMultimedia import QAudioDevice, QAudioOutput, QMediaDevices, QMediaPlayer
+
+MAX_GAIN = 2.0
 
 
-def _fourcc(code: str) -> int:
-    return int.from_bytes(code.encode("ascii"), "big")
+class AudioBus(QObject):
+    changed = Signal()
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.gain = 1.0
+        self.muted = False
+        self.device: QAudioDevice = QMediaDevices.defaultAudioOutput()
+        self._device_id: bytes | None = None   # None = follow the system default
+        self._outputs: "weakref.WeakSet[QAudioOutput]" = weakref.WeakSet()
+        self._test_player: QMediaPlayer | None = None
+        self._media_devices = QMediaDevices(self)
+        self._media_devices.audioOutputsChanged.connect(self._devices_changed)
 
-_SYSTEM_OBJECT = 1
-_DEVICES = _fourcc("dev#")
-_DEFAULT_OUTPUT = _fourcc("dOut")
-_DEFAULT_SYSTEM_OUTPUT = _fourcc("sOut")
-_NAME = _fourcc("lnam")
-_STREAMS = _fourcc("stm#")
-_SCOPE_GLOBAL = _fourcc("glob")
-_SCOPE_OUTPUT = _fourcc("outp")
-_ELEMENT_MAIN = 0
-_UTF8 = 0x08000100
+    # --- outputs ---------------------------------------------------------
 
+    def create_output(self, parent: QObject) -> QAudioOutput:
+        output = QAudioOutput(self.device, parent)
+        self._apply(output)
+        self._outputs.add(output)
+        return output
 
-class _Address(ctypes.Structure):
-    _fields_ = [("selector", c_uint32), ("scope", c_uint32), ("element", c_uint32)]
+    def _apply(self, output: QAudioOutput):
+        output.setDevice(self.device)
+        output.setVolume(self.gain / MAX_GAIN)
+        output.setMuted(self.muted)
 
+    def _apply_all(self):
+        for output in list(self._outputs):
+            self._apply(output)
+        self.changed.emit()
 
-_libs: tuple | None = None
+    # --- controls --------------------------------------------------------
 
+    @property
+    def percent(self) -> int:
+        return round(self.gain * 100)
 
-def _load():
-    global _libs
-    if _libs is None:
-        ca = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
-        cf = ctypes.cdll.LoadLibrary("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-        ca.AudioObjectGetPropertyDataSize.argtypes = [c_uint32, POINTER(_Address), c_uint32, c_void_p, POINTER(c_uint32)]
-        ca.AudioObjectGetPropertyDataSize.restype = ctypes.c_int32
-        ca.AudioObjectGetPropertyData.argtypes = [c_uint32, POINTER(_Address), c_uint32, c_void_p, POINTER(c_uint32), c_void_p]
-        ca.AudioObjectGetPropertyData.restype = ctypes.c_int32
-        ca.AudioObjectSetPropertyData.argtypes = [c_uint32, POINTER(_Address), c_uint32, c_void_p, c_uint32, c_void_p]
-        ca.AudioObjectSetPropertyData.restype = ctypes.c_int32
-        cf.CFStringGetCString.argtypes = [c_void_p, ctypes.c_char_p, ctypes.c_long, c_uint32]
-        cf.CFStringGetCString.restype = ctypes.c_bool
-        cf.CFRelease.argtypes = [c_void_p]
-        _libs = (ca, cf)
-    return _libs
+    def set_percent(self, percent: int):
+        gain = max(0.0, min(MAX_GAIN, percent / 100))
+        if abs(gain - self.gain) > 1e-6:
+            self.gain = gain
+            self._apply_all()
 
+    def nudge(self, delta_percent: int):
+        self.set_percent(self.percent + delta_percent)
 
-def _size(obj: int, selector: int, scope: int = _SCOPE_GLOBAL) -> int:
-    ca, _ = _load()
-    size = c_uint32(0)
-    addr = _Address(selector, scope, _ELEMENT_MAIN)
-    if ca.AudioObjectGetPropertyDataSize(obj, byref(addr), 0, None, byref(size)) != 0:
-        return 0
-    return size.value
+    def set_muted(self, muted: bool):
+        if muted != self.muted:
+            self.muted = muted
+            self._apply_all()
 
+    def toggle_mute(self):
+        self.set_muted(not self.muted)
 
-def _device_ids() -> list[int]:
-    ca, _ = _load()
-    size = _size(_SYSTEM_OBJECT, _DEVICES)
-    count = size // sizeof(c_uint32)
-    if not count:
-        return []
-    ids = (c_uint32 * count)()
-    size_ref = c_uint32(size)
-    addr = _Address(_DEVICES, _SCOPE_GLOBAL, _ELEMENT_MAIN)
-    if ca.AudioObjectGetPropertyData(_SYSTEM_OBJECT, byref(addr), 0, None, byref(size_ref), ids) != 0:
-        return []
-    return list(ids)
+    # --- devices ---------------------------------------------------------
 
+    @staticmethod
+    def devices() -> list[QAudioDevice]:
+        return list(QMediaDevices.audioOutputs())
 
-def _device_name(device: int) -> str:
-    ca, cf = _load()
-    ref = c_void_p()
-    size = c_uint32(sizeof(ref))
-    addr = _Address(_NAME, _SCOPE_GLOBAL, _ELEMENT_MAIN)
-    if ca.AudioObjectGetPropertyData(device, byref(addr), 0, None, byref(size), byref(ref)) != 0 or not ref.value:
-        return f"Device {device}"
-    buf = ctypes.create_string_buffer(512)
-    ok = cf.CFStringGetCString(ref, buf, len(buf), _UTF8)
-    cf.CFRelease(ref)
-    return buf.value.decode("utf-8", "replace") if ok else f"Device {device}"
+    def device_name(self) -> str:
+        return "System default" if self._device_id is None else self.device.description()
 
+    def set_device_by_name(self, name: str | None):
+        """None/'' = follow the system default output."""
+        match = next((d for d in self.devices() if d.description() == name), None) if name else None
+        self._device_id = bytes(match.id()) if match else None
+        self.device = match or QMediaDevices.defaultAudioOutput()
+        self._apply_all()
 
-def _default_output() -> int:
-    ca, _ = _load()
-    device = c_uint32(0)
-    size = c_uint32(sizeof(device))
-    addr = _Address(_DEFAULT_OUTPUT, _SCOPE_GLOBAL, _ELEMENT_MAIN)
-    ca.AudioObjectGetPropertyData(_SYSTEM_OBJECT, byref(addr), 0, None, byref(size), byref(device))
-    return device.value
+    def _devices_changed(self):
+        # HDMI plugged/unplugged: re-find our device, or fall back to the new default.
+        match = next((d for d in self.devices() if bytes(d.id()) == self._device_id), None)
+        self.device = match or QMediaDevices.defaultAudioOutput()
+        self._apply_all()
 
+    # --- test sound ------------------------------------------------------
 
-def list_output_devices() -> list[str]:
-    """Names of every device that can play sound (speakers, HDMI, AirPlay, USB...)."""
-    if not macos.IS_MAC:
-        return []
-    try:
-        return [_device_name(d) for d in _device_ids() if _size(d, _STREAMS, _SCOPE_OUTPUT) > 0]
-    except OSError:
-        return []
-
-
-def current_output_device() -> str | None:
-    if not macos.IS_MAC:
-        return None
-    try:
-        return _device_name(_default_output())
-    except OSError:
-        return None
-
-
-def set_output_device(name: str) -> bool:
-    if not macos.IS_MAC:
-        return False
-    try:
-        ca, _ = _load()
-        for device in _device_ids():
-            if _size(device, _STREAMS, _SCOPE_OUTPUT) > 0 and _device_name(device) == name:
-                value = c_uint32(device)
-                ok = True
-                for selector in (_DEFAULT_OUTPUT, _DEFAULT_SYSTEM_OUTPUT):
-                    addr = _Address(selector, _SCOPE_GLOBAL, _ELEMENT_MAIN)
-                    ok &= ca.AudioObjectSetPropertyData(_SYSTEM_OBJECT, byref(addr), 0, None, sizeof(value), byref(value)) == 0
-                return ok
-    except OSError:
-        pass
-    return False
-
-
-def set_volume(percent: int) -> bool:
-    """Set the system output volume and make sure it is not muted."""
-    if not macos.IS_MAC:
-        return False
-    percent = max(0, min(100, int(percent)))
-    try:
-        macos.osascript(f"set volume output volume {percent}\nset volume output muted false", timeout=5)
-        return True
-    except macos.AppleScriptError:
-        return False
-
-
-def apply(device: str | None, volume: int | None) -> None:
-    """Called before the show and before each presentation; cheap and idempotent.
-
-    Re-applying each time matters: plugging/unplugging HDMI makes macOS switch outputs.
-    """
-    if device:
-        set_output_device(device)
-    if volume is not None:
-        set_volume(volume)
+    def play_test_tone(self):
+        """Chime left then right, through the bus (so slider, mute and device all apply)."""
+        if self._test_player is None:
+            self._test_player = QMediaPlayer(self)
+            self._test_player.setAudioOutput(self.create_output(self._test_player))
+            self._test_player.setSource(QUrl.fromLocalFile(str(_test_tone())))
+        self._test_player.setPosition(0)
+        self._test_player.play()
 
 
 def _test_tone() -> Path:
-    """A two-note chime: first in the left speaker, then in the right."""
-    path = Path(tempfile.gettempdir()) / "showrunner-test-tone.wav"
+    path = Path(tempfile.gettempdir()) / "showrunner-test-tone-v2.wav"
     if path.exists():
         return path
-    rate = 44100
+    rate = 48000
     frames = bytearray()
     for freq, channel in ((660.0, 0), (880.0, 1)):
         n = int(rate * 0.6)
         for i in range(n):
             envelope = min(1.0, i / 800) * math.exp(-3.0 * i / n)
-            sample = int(0.5 * 32767 * envelope * math.sin(2 * math.pi * freq * i / rate))
-            left, right = (sample, 0) if channel == 0 else (0, sample)
-            frames += struct.pack("<hh", left, right)
+            # Peak around -1 dBFS, roughly the level of normalized clips.
+            sample = int(0.89 * 32767 * envelope * math.sin(2 * math.pi * freq * i / rate))
+            frames += struct.pack("<hh", *((sample, 0) if channel == 0 else (0, sample)))
     with wave.open(str(path), "wb") as wav:
         wav.setnchannels(2)
         wav.setsampwidth(2)
         wav.setframerate(rate)
         wav.writeframes(bytes(frames))
     return path
-
-
-def play_test_tone() -> bool:
-    """Play through the system default output - the same route Keynote/PowerPoint use."""
-    path = _test_tone()
-    if macos.IS_MAC:
-        subprocess.Popen(["afplay", str(path)])
-        return True
-    try:
-        import winsound
-
-        winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
-        return True
-    except ImportError:
-        return False

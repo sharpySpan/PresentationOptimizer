@@ -6,3 +6,4 @@ dist/
 .pytest_cache/
 .idea/
 .DS_Store
+.showrunner/

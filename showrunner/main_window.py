@@ -1,23 +1,27 @@
-"""The set-up screen: pick the folder, drag presentations into order, check sound, start."""
+"""The set-up screen: pick the folder, see a preview of every file, put them in order, start."""
 from __future__ import annotations
 
 import random
+import shutil
 from pathlib import Path
 
-from PySide6.QtCore import QFileSystemWatcher, QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QGuiApplication
+from PySide6.QtCore import QFileSystemWatcher, QSettings, QSize, QStandardPaths, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton,
-    QSlider, QSpinBox, QStyle, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QPushButton, QSlider, QSpinBox, QStyle,
+    QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from . import audio, checks, macos, runners
+from . import system
+from .audio import AudioBus
 from .library import Presentation, load_order, natural_key, save_order
+from .prepare import CACHE_DIRNAME, Prepared, PrepareWorker, load_cached
 from .show import ShowController, ShowSettings
 
 PATH_ROLE = Qt.UserRole
-KEEP_SYSTEM_DEVICE = "Keep current system output"
+NUMBER_ROLE = Qt.UserRole + 1
+THUMB = QSize(192, 108)
 
 
 class OrderList(QListWidget):
@@ -28,47 +32,77 @@ class OrderList(QListWidget):
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.setAlternatingRowColors(True)
+        self.setIconSize(THUMB)
+        self.setSpacing(3)
+        self.setUniformItemSizes(True)
 
     def dropEvent(self, event):
         super().dropEvent(event)
         self.reordered.emit()
 
 
+def _thumb_icon(path: Path | None, text: str = "") -> QIcon:
+    """A 16:9 tile with the preview fitted in, so all rows line up."""
+    tile = QPixmap(THUMB * 2)
+    tile.setDevicePixelRatio(2)
+    tile.fill(QColor("#22262b"))
+    painter = QPainter(tile)
+    source = QPixmap(str(path)) if path else QPixmap()
+    if not source.isNull():
+        scaled = source.scaled(THUMB * 2, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        scaled.setDevicePixelRatio(2)
+        size = scaled.deviceIndependentSize()
+        painter.drawPixmap(int((THUMB.width() - size.width()) / 2), int((THUMB.height() - size.height()) / 2), scaled)
+    else:
+        painter.setPen(QColor("#9aa0a6"))
+        painter.drawText(tile.rect().adjusted(0, 0, -THUMB.width(), -THUMB.height()), Qt.AlignCenter, text)
+    painter.end()
+    return QIcon(tile)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Showrunner")
-        self.resize(1120, 740)
+        self.resize(1240, 800)
         self.settings = QSettings()
         self.folder: Path | None = None
         self.items: list[Presentation] = []
-        self.results: dict[Path, checks.CheckResult] = {}
+        self.prepared: dict[str, Prepared] = {}
+        self.status: dict[str, str] = {}
         self.controller: ShowController | None = None
+        self.bus = AudioBus(self)
+
+        cache_root = Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation)) / "prepared"
+        self.cache_root = cache_root
+        self.worker = PrepareWorker(cache_root, self)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.prepared.connect(self._on_prepared)
+        self.worker.start()
 
         self.watcher = QFileSystemWatcher(self)
         self.watcher.directoryChanged.connect(lambda _: self.reload_timer.start())
-        # Debounced: students copying 40 files in at once fire lots of change events.
-        self.reload_timer = QTimer(self, singleShot=True, interval=800)
+        # Debounced: copying 40 files in at once fires lots of change events.
+        self.reload_timer = QTimer(self, singleShot=True, interval=1500)
         self.reload_timer.timeout.connect(self.reload_folder)
 
         self._build_ui()
         self._load_settings()
+        QShortcut(QKeySequence("Alt+S"), self, self.bus.toggle_mute)
         app = QGuiApplication.instance()
         app.screenAdded.connect(lambda _: self._fill_screens())
         app.screenRemoved.connect(lambda _: self._fill_screens())
 
-    # --- UI --------------------------------------------------------------
+    # --- UI ------------------------------------------------------------------
 
     def _build_ui(self):
         style = self.style()
 
         self.folder_label = QLabel("No folder chosen")
-        self.folder_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.folder_label.setStyleSheet("font-weight:600;")
         choose = QPushButton("Choose folder…")
         choose.clicked.connect(self.choose_folder)
-        reveal = QPushButton("Show in Finder" if macos.IS_MAC else "Open folder")
+        reveal = QPushButton("Open folder")
         reveal.clicked.connect(lambda: self.folder and QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.folder))))
         top = QHBoxLayout()
         top.addWidget(self.folder_label, 1)
@@ -79,8 +113,8 @@ class MainWindow(QMainWindow):
         self.list.reordered.connect(self._on_reordered)
         self.list.itemChanged.connect(self._on_item_changed)
         self.list.currentRowChanged.connect(self._update_details)
-        self.list.itemDoubleClicked.connect(lambda item: self.start_show(from_selected=True))
-        self.list.setStyleSheet("QListWidget { font-size: 15px; } QListWidget::item { padding: 7px 4px; }")
+        self.list.itemDoubleClicked.connect(lambda _: self.start_show(True))
+        self.list.setStyleSheet("QListWidget { font-size: 14px; } QListWidget::item { padding: 4px; }")
 
         up = QPushButton(style.standardIcon(QStyle.SP_ArrowUp), "")
         up.setToolTip("Move up")
@@ -88,18 +122,20 @@ class MainWindow(QMainWindow):
         down = QPushButton(style.standardIcon(QStyle.SP_ArrowDown), "")
         down.setToolTip("Move down")
         down.clicked.connect(lambda: self._move(1))
-        sort = QPushButton("Sort A–Z")
+        self.sort_combo = QComboBox()
+        for label, key in (("Sort by name A–Z", "az"), ("Sort by name Z–A", "za"),
+                           ("Sort by date added", "date"), ("Random order", "random")):
+            self.sort_combo.addItem(label, key)
+        sort = QPushButton("Apply")
         sort.clicked.connect(self._sort)
-        shuffle = QPushButton("Shuffle")
-        shuffle.setToolTip("Random order")
-        shuffle.clicked.connect(self._shuffle)
-        check = QPushButton("Check all files")
-        check.clicked.connect(self.run_checks)
+        retry = QPushButton("Prepare again")
+        retry.setToolTip("Re-convert the selected file (e.g. after installing LibreOffice)")
+        retry.clicked.connect(self._reprepare_selected)
         list_buttons = QHBoxLayout()
-        for widget in (up, down, sort, shuffle):
+        for widget in (up, down, self.sort_combo, sort):
             list_buttons.addWidget(widget)
         list_buttons.addStretch(1)
-        list_buttons.addWidget(check)
+        list_buttons.addWidget(retry)
 
         self.summary = QLabel()
         self.summary.setStyleSheet("color:gray;")
@@ -113,113 +149,115 @@ class MainWindow(QMainWindow):
         left.addWidget(hint)
         left.addWidget(self.summary)
 
+        # Selected file preview
+        self.preview = QLabel()
+        self.preview.setFixedHeight(200)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setStyleSheet("background:#22262b; border-radius:6px;")
+        self.detail = QTextBrowser()
+        self.detail.setMaximumHeight(130)
+        detail_layout = QVBoxLayout()
+        detail_layout.addWidget(self.preview)
+        detail_layout.addWidget(self.detail)
+        detail = QGroupBox("Selected")
+        detail.setLayout(detail_layout)
+
         # Sound
         self.device_combo = QComboBox()
-        refresh = QPushButton(style.standardIcon(QStyle.SP_BrowserReload), "")
-        refresh.setToolTip("Look for new speakers / HDMI")
-        refresh.clicked.connect(self._fill_devices)
-        device_row = QHBoxLayout()
-        device_row.addWidget(self.device_combo, 1)
-        device_row.addWidget(refresh)
-        self.volume_check = QCheckBox("Set volume and unmute before every talk")
-        self.volume_slider = QSlider(Qt.Horizontal, minimum=0, maximum=100, value=80)
-        self.volume_value = QLabel("80%")
-        self.volume_slider.valueChanged.connect(lambda v: self.volume_value.setText(f"{v}%"))
-        self.volume_check.toggled.connect(self.volume_slider.setEnabled)
+        self.device_combo.currentIndexChanged.connect(lambda _: self.bus.set_device_by_name(self.device_combo.currentData()))
+        self.volume_slider = QSlider(Qt.Horizontal, minimum=0, maximum=200, value=100)
+        self.volume_slider.setPageStep(10)
+        self.volume_slider.valueChanged.connect(self.bus.set_percent)
+        self.volume_value = QLabel("100%")
+        self.volume_value.setMinimumWidth(42)
+        self.mute_button = QPushButton("Mute (Alt+S)")
+        self.mute_button.setCheckable(True)
+        self.mute_button.clicked.connect(self.bus.set_muted)
+        test = QPushButton("Test sound")
+        test.clicked.connect(self.bus.play_test_tone)
+        self.bus.changed.connect(self._sync_sound)
         volume_row = QHBoxLayout()
         volume_row.addWidget(self.volume_slider, 1)
         volume_row.addWidget(self.volume_value)
-        test = QPushButton("Play test sound (left, then right)")
-        test.clicked.connect(self.test_sound)
+        sound_buttons = QHBoxLayout()
+        sound_buttons.addWidget(self.mute_button)
+        sound_buttons.addWidget(test)
         sound_form = QFormLayout()
-        sound_form.addRow("Output", device_row)
-        sound_form.addRow(self.volume_check)
+        sound_form.addRow("Output", self.device_combo)
         sound_form.addRow("Volume", volume_row)
-        sound_form.addRow(test)
+        sound_form.addRow(sound_buttons)
+        level_note = QLabel("All sound is levelled to the same loudness. 0–200%.")
+        level_note.setStyleSheet("color:gray;")
+        sound_form.addRow(level_note)
         sound = QGroupBox("Sound")
         sound.setLayout(sound_form)
 
         # Show
-        self.screen_combo = QComboBox()
-        self.app_combo = QComboBox()
-        self.app_combo.addItem("Keynote", "keynote")
-        self.app_combo.addItem("PowerPoint", "powerpoint")
+        self.beamer_combo = QComboBox()
+        self.console_combo = QComboBox()
+        self.windowed = QCheckBox("Test mode: show in windows, not full screen")
+        self.talk_spin = QSpinBox(minimum=0, maximum=60, suffix=" min")
+        self.talk_spin.setSpecialValueText("No limit")
         self.auto_spin = QSpinBox(minimum=0, maximum=120, suffix=" s")
-        self.auto_spin.setSpecialValueText("Off - wait for a key")
+        self.auto_spin.setSpecialValueText("Off - wait for →")
         show_form = QFormLayout()
-        show_form.addRow("Show on", self.screen_combo)
-        show_form.addRow("Play .pptx with", self.app_combo)
+        show_form.addRow("Beamer", self.beamer_combo)
+        show_form.addRow("Console", self.console_combo)
+        show_form.addRow(self.windowed)
+        show_form.addRow("Talk length", self.talk_spin)
         show_form.addRow("Auto-start next", self.auto_spin)
-        apps = QLabel(self._apps_text())
-        apps.setWordWrap(True)
-        apps.setStyleSheet("color:gray;")
-        show_form.addRow(apps)
+        converters = system.converter_names()
+        conv = QLabel("Slide converter: " + (", ".join(converters) if converters
+                                              else "none found - install LibreOffice for .pptx/.key/.odp"))
+        conv.setWordWrap(True)
+        conv.setStyleSheet("color:gray;" if converters else "color:#d0342c;")
+        show_form.addRow(conv)
         show_box = QGroupBox("Show")
         show_box.setLayout(show_form)
 
-        # Selected
-        self.detail_name = QLabel("-")
-        self.detail_name.setWordWrap(True)
-        self.detail_name.setStyleSheet("font-weight:600;")
-        self.detail_info = QLabel()
-        self.detail_info.setWordWrap(True)
-        self.detail_info.setTextFormat(Qt.RichText)
-        detail_layout = QVBoxLayout()
-        detail_layout.addWidget(self.detail_name)
-        detail_layout.addWidget(self.detail_info)
-        detail = QGroupBox("Selected")
-        detail.setLayout(detail_layout)
-
         self.start_button = QPushButton("▶  Start the show")
-        self.start_button.setMinimumHeight(54)
+        self.start_button.setMinimumHeight(52)
         self.start_button.setStyleSheet("font-size:18px; font-weight:700;")
         self.start_button.clicked.connect(lambda: self.start_show(False))
         self.start_selected = QPushButton("Start from selected")
         self.start_selected.clicked.connect(lambda: self.start_show(True))
-        keys = QLabel("During the show: → / Space / clicker = next · ← = back · S = skip · Esc = end talk / exit")
-        keys.setWordWrap(True)
-        keys.setStyleSheet("color:gray;")
 
         right = QVBoxLayout()
+        right.addWidget(detail)
         right.addWidget(sound)
         right.addWidget(show_box)
-        right.addWidget(detail)
         right.addStretch(1)
-        right.addWidget(keys)
         right.addWidget(self.start_selected)
         right.addWidget(self.start_button)
 
         root = QHBoxLayout()
-        root.addLayout(left, 3)
+        root.addLayout(left, 1)
         right_widget = QWidget()
         right_widget.setLayout(right)
-        right_widget.setFixedWidth(380)
+        right_widget.setFixedWidth(400)
         root.addWidget(right_widget)
         central = QWidget()
         central.setLayout(root)
         self.setCentralWidget(central)
 
-    def _apps_text(self) -> str:
-        if not macos.IS_MAC:
-            return "Not on macOS: only PDFs, images and videos can be played here."
-        found = [name for name, ok in (
-            ("Keynote", macos.app_installed(runners.KEYNOTE)),
-            ("PowerPoint", macos.app_installed(runners.POWERPOINT)),
-            ("LibreOffice", bool(macos.soffice_path())),
-        ) if ok]
-        return "Installed: " + (", ".join(found) if found else "no slide apps - install Keynote (free)")
+    def _sync_sound(self):
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setValue(self.bus.percent)
+        self.volume_slider.blockSignals(False)
+        self.volume_value.setText(f"{self.bus.percent}%")
+        self.mute_button.setChecked(self.bus.muted)
+        self.mute_button.setText("MUTED (Alt+S)" if self.bus.muted else "Mute (Alt+S)")
 
-    # --- settings --------------------------------------------------------
+    # --- settings ------------------------------------------------------------
 
     def _load_settings(self):
         s = self.settings
-        self.volume_check.setChecked(s.value("volume_enabled", True, type=bool))
-        self.volume_slider.setValue(s.value("volume", 80, type=int))
-        self.volume_slider.setEnabled(self.volume_check.isChecked())
-        index = self.app_combo.findData(s.value("slide_app", "keynote"))
-        self.app_combo.setCurrentIndex(max(index, 0))
+        self.sort_combo.setCurrentIndex(max(0, self.sort_combo.findData(s.value("sort", "az"))))
+        self.talk_spin.setValue(s.value("talk_minutes", 0, type=int))
         self.auto_spin.setValue(s.value("auto_start", 0, type=int))
-        self._fill_devices()
+        self.windowed.setChecked(s.value("windowed", False, type=bool))
+        self.bus.set_percent(s.value("volume", 100, type=int))
+        self._fill_devices(s.value("audio_device", ""))
         self._fill_screens()
         folder = s.value("folder", "")
         if folder and Path(folder).is_dir():
@@ -228,47 +266,49 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         s = self.settings
-        s.setValue("volume_enabled", self.volume_check.isChecked())
-        s.setValue("volume", self.volume_slider.value())
-        s.setValue("slide_app", self.app_combo.currentData())
+        s.setValue("sort", self.sort_combo.currentData())
+        s.setValue("talk_minutes", self.talk_spin.value())
         s.setValue("auto_start", self.auto_spin.value())
+        s.setValue("windowed", self.windowed.isChecked())
+        s.setValue("volume", self.bus.percent)
         s.setValue("audio_device", self.device_combo.currentData() or "")
-        s.setValue("screen", self.screen_combo.currentData() or "")
+        s.setValue("beamer", self.beamer_combo.currentData() or "")
+        s.setValue("console", self.console_combo.currentData() or "")
         if self.folder:
             s.setValue("folder", str(self.folder))
 
-    def _fill_devices(self):
-        wanted = self.device_combo.currentData() if self.device_combo.count() else self.settings.value("audio_device", "")
-        devices = audio.list_output_devices()
-        current = audio.current_output_device()
+    def _fill_devices(self, wanted: str):
+        self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        self.device_combo.addItem(KEEP_SYSTEM_DEVICE, "")
-        for name in devices:
-            self.device_combo.addItem(f"{name}  (current)" if name == current else name, name)
-        self.device_combo.setEnabled(bool(devices))
-        index = self.device_combo.findData(wanted)
-        self.device_combo.setCurrentIndex(max(index, 0))
+        self.device_combo.addItem("System default output", "")
+        for device in self.bus.devices():
+            self.device_combo.addItem(device.description(), device.description())
+        self.device_combo.setCurrentIndex(max(0, self.device_combo.findData(wanted)))
+        self.device_combo.blockSignals(False)
+        self.bus.set_device_by_name(self.device_combo.currentData())
 
     def _fill_screens(self):
-        wanted = self.screen_combo.currentData() if self.screen_combo.count() else self.settings.value("screen", "")
         screens = QGuiApplication.screens()
         primary = QGuiApplication.primaryScreen()
-        self.screen_combo.clear()
-        for screen in screens:
-            g = screen.geometry()
-            label = f"{screen.name()}  ({g.width()}×{g.height()})" + ("  - main" if screen is primary else "")
-            self.screen_combo.addItem(label, screen.name())
-        index = self.screen_combo.findData(wanted)
-        if index < 0:
-            # Default to the projector: the first screen that isn't the laptop's own.
-            index = next((i for i, s in enumerate(screens) if s is not primary), 0)
-        self.screen_combo.setCurrentIndex(index)
+        for combo, key, prefer_primary in ((self.beamer_combo, "beamer", False), (self.console_combo, "console", True)):
+            wanted = combo.currentData() if combo.count() else self.settings.value(key, "")
+            combo.clear()
+            for screen in screens:
+                g = screen.geometry()
+                label = f"{screen.name()}  ({g.width()}×{g.height()})" + ("  - main" if screen is primary else "")
+                combo.addItem(label, screen.name())
+            index = combo.findData(wanted)
+            if index < 0:
+                # Defaults: console on the main screen, beamer on the first other screen.
+                index = next((i for i, s in enumerate(screens) if (s is primary) == prefer_primary), 0)
+            combo.setCurrentIndex(index)
 
     def closeEvent(self, event):
         self._save_settings()
+        self.worker.stop()
         super().closeEvent(event)
 
-    # --- folder & list ---------------------------------------------------
+    # --- folder & list -------------------------------------------------------
 
     def choose_folder(self):
         start = str(self.folder) if self.folder else str(Path.home())
@@ -282,47 +322,99 @@ class MainWindow(QMainWindow):
         self.folder = folder
         self.folder_label.setText(str(folder))
         self.watcher.addPath(str(folder))
-        self.results.clear()
+        self.prepared.clear()
+        self.status.clear()
         self.items = load_order(folder)
+        self._queue_unprepared()
         self._refresh_list()
         self._save_settings()
-        self.run_checks()
 
     def reload_folder(self):
         """New/removed files: keep the current order, add newcomers at the end."""
         if not self.folder or not self.folder.is_dir():
             return
         save_order(self.folder, self.items)
-        known = {p.path for p in self.items}
         self.items = load_order(self.folder)
-        for item in self.items:
-            if item.path not in known:
-                self.results[item.path] = checks.check(item, self.app_combo.currentData())
+        self._queue_unprepared()
         self._refresh_list()
+
+    def _queue_unprepared(self):
+        for item in self.items:
+            key = str(item.path)
+            if key in self.prepared or self.status.get(key) == "Waiting…":
+                continue
+            cached = load_cached(item, self.cache_root) if item.path.exists() else None
+            if cached:
+                self.prepared[key] = cached
+            else:
+                self.status[key] = "Waiting…"
+                self.worker.add(item)
+
+    def _on_progress(self, key: str, text: str):
+        self.status[key] = text
+        self._update_row(key)
+
+    def _on_prepared(self, key: str, prepared: Prepared):
+        self.prepared[key] = prepared
+        self.status.pop(key, None)
+        self._update_row(key)
+        self._update_summary()
+        if self._selected_path() == key:
+            self._update_details()
+
+    def _row_text(self, number: str, item: Presentation) -> str:
+        key = str(item.path)
+        prepared = self.prepared.get(key)
+        if key in self.status:
+            state = "⏳ " + self.status[key]
+        elif prepared is None:
+            state = ""
+        elif prepared.error:
+            state = "✖ " + prepared.error
+        else:
+            parts = []
+            if prepared.kind in ("slides",):
+                parts.append(f"{prepared.page_count} slides")
+            clips = sum(len(s.clips) for s in prepared.slides)
+            if clips:
+                parts.append(f"{clips} audio/video")
+            if any(s.notes for s in prepared.slides):
+                parts.append("notes")
+            state = ("⚠ " if prepared.warnings else "✓ ") + " · ".join(parts or ["ready"])
+        return f"{number}   {item.name}\n       {item.label}  ·  {state}"
+
+    def _update_row(self, key: str):
+        for i in range(self.list.count()):
+            row = self.list.item(i)
+            if row.data(PATH_ROLE) == key:
+                self.list.blockSignals(True)
+                item = next(p for p in self.items if str(p.path) == key)
+                row.setText(self._row_text(row.data(NUMBER_ROLE), item))
+                row.setIcon(self._icon_for(item))
+                self.list.blockSignals(False)
+
+    def _icon_for(self, item: Presentation) -> QIcon:
+        prepared = self.prepared.get(str(item.path))
+        if prepared and prepared.thumb and not prepared.error:
+            return _thumb_icon(prepared.path(prepared.thumb, item.path))
+        return _thumb_icon(None, item.label)
 
     def _refresh_list(self):
         selected = self._selected_path()
-        style = self.style()
-        icons = {
-            checks.OK: style.standardIcon(QStyle.SP_DialogApplyButton),
-            checks.WARN: style.standardIcon(QStyle.SP_MessageBoxWarning),
-            checks.ERROR: style.standardIcon(QStyle.SP_MessageBoxCritical),
-        }
         self.list.blockSignals(True)
         self.list.clear()
         number = 0
         for item in self.items:
             if item.enabled:
                 number += 1
-            prefix = f"{number:02d}" if item.enabled else "  –"
-            row = QListWidgetItem(f"{prefix}    {item.name}      ·  {item.label}")
+            label = f"{number:02d}" if item.enabled else " – "
+            row = QListWidgetItem(self._row_text(label, item))
             row.setData(PATH_ROLE, str(item.path))
+            row.setData(NUMBER_ROLE, label)
             row.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsDragEnabled | Qt.ItemIsUserCheckable)
             row.setCheckState(Qt.Checked if item.enabled else Qt.Unchecked)
-            result = self.results.get(item.path)
-            if result:
-                row.setIcon(icons[result.level])
-                row.setToolTip(result.message)
+            row.setIcon(self._icon_for(item))
+            row.setToolTip(str(item.path))
             if not item.enabled:
                 row.setForeground(Qt.gray)
             self.list.addItem(row)
@@ -362,73 +454,72 @@ class MainWindow(QMainWindow):
         self._commit_order()
 
     def _sort(self):
-        self.items.sort(key=lambda p: natural_key(p.path.name))
+        key = self.sort_combo.currentData()
+        if key == "random":
+            if QMessageBox.question(self, "Random order", "Put all presentations in a random order?") != QMessageBox.Yes:
+                return
+            random.shuffle(self.items)
+        elif key == "date":
+            self.items.sort(key=lambda p: p.path.stat().st_mtime if p.path.exists() else 0)
+        else:
+            self.items.sort(key=lambda p: natural_key(p.name), reverse=key == "za")
+        self._save_settings()
         self._commit_order()
 
-    def _shuffle(self):
-        if QMessageBox.question(self, "Shuffle", "Put all presentations in a random order?") == QMessageBox.Yes:
-            random.shuffle(self.items)
-            self._commit_order()
+    def _reprepare_selected(self):
+        key = self._selected_path()
+        item = next((p for p in self.items if str(p.path) == key), None)
+        if item is None:
+            return
+        prepared = self.prepared.pop(key, None)
+        if prepared and prepared.dir and Path(prepared.dir).parent.name in (CACHE_DIRNAME, self.cache_root.name):
+            shutil.rmtree(prepared.dir, ignore_errors=True)
+        self.status[key] = "Waiting…"
+        self.worker.add(item)
+        self._update_row(key)
 
     def _update_details(self, *_):
-        path = self._selected_path()
-        item = next((p for p in self.items if str(p.path) == path), None)
+        key = self._selected_path()
+        item = next((p for p in self.items if str(p.path) == key), None)
         if item is None:
-            self.detail_name.setText("-")
-            self.detail_info.setText("")
+            self.preview.clear()
+            self.detail.setHtml("")
             return
-        result = self.results.get(item.path)
-        self.detail_name.setText(item.path.name)
-        color = {checks.OK: "#2e9e4f", checks.WARN: "#c98a00", checks.ERROR: "#d0342c"}.get(result.level if result else "", "gray")
-        message = result.message if result else "Not checked yet"
-        self.detail_info.setText(f"{item.label}<br><span style='color:{color}'>{message}</span>")
+        prepared = self.prepared.get(key)
+        pixmap = QPixmap()
+        if prepared and prepared.thumb and not prepared.error:
+            pixmap = QPixmap(str(prepared.path(prepared.thumb, item.path)))
+        if pixmap.isNull():
+            self.preview.setText(self.status.get(key, item.label))
+        else:
+            self.preview.setPixmap(pixmap.scaled(QSize(370, 200), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        html = [f"<b>{item.path.name}</b>"]
+        if prepared and prepared.error:
+            html.append(f"<p style='color:#d0342c'>{prepared.error}</p>")
+        elif prepared:
+            html += [f"<p style='color:#c98a00'>⚠ {w}</p>" for w in prepared.warnings]
+            notes = next((s.notes for s in prepared.slides if s.notes), "")
+            if notes:
+                html.append(f"<p style='color:gray'>Notes: {notes[:200]}</p>")
+        self.detail.setHtml("".join(html))
 
     def _update_summary(self):
-        enabled = sum(p.enabled for p in self.items)
-        skipped = len(self.items) - enabled
-        warn = sum(1 for p in self.items if p.enabled and self.results.get(p.path, None) and self.results[p.path].level == checks.WARN)
-        err = sum(1 for p in self.items if p.enabled and self.results.get(p.path, None) and self.results[p.path].level == checks.ERROR)
-        parts = [f"{enabled} presentations"]
-        if skipped:
-            parts.append(f"{skipped} skipped")
-        if warn:
-            parts.append(f"{warn} with warnings")
-        if err:
-            parts.append(f"{err} won't play")
+        enabled = [p for p in self.items if p.enabled]
+        ready = sum(1 for p in enabled if (pr := self.prepared.get(str(p.path))) and not pr.error)
+        failed = sum(1 for p in enabled if (pr := self.prepared.get(str(p.path))) and pr.error)
+        parts = [f"{len(enabled)} presentations", f"{ready} ready"]
+        if failed:
+            parts.append(f"{failed} can't be played")
+        if len(self.items) - len(enabled):
+            parts.append(f"{len(self.items) - len(enabled)} skipped")
         self.summary.setText("  ·  ".join(parts) if self.folder else "Choose the folder that holds everyone's presentation.")
-        self.start_button.setEnabled(enabled > 0)
-        self.start_selected.setEnabled(enabled > 0)
+        self.start_button.setEnabled(bool(enabled))
+        self.start_selected.setEnabled(bool(enabled))
 
-    # --- actions ---------------------------------------------------------
+    # --- show ------------------------------------------------------------------
 
-    def run_checks(self):
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            prefer = self.app_combo.currentData()
-            for item in self.items:
-                self.results[item.path] = checks.check(item, prefer)
-                QApplication.processEvents()
-        finally:
-            QApplication.restoreOverrideCursor()
-        self._refresh_list()
-
-    def test_sound(self):
-        audio.apply(self.device_combo.currentData() or None,
-                    self.volume_slider.value() if self.volume_check.isChecked() else None)
-        self._fill_devices()
-        if not audio.play_test_tone():
-            QMessageBox.information(self, "Test sound", "Couldn't play a test sound on this system.")
-
-    def _show_settings(self) -> ShowSettings:
-        wanted = self.screen_combo.currentData()
-        screen = next((s for s in QGuiApplication.screens() if s.name() == wanted), QGuiApplication.primaryScreen())
-        return ShowSettings(
-            screen=screen,
-            audio_device=self.device_combo.currentData() or None,
-            volume=self.volume_slider.value() if self.volume_check.isChecked() else None,
-            slide_app=self.app_combo.currentData(),
-            auto_start=self.auto_spin.value(),
-        )
+    def _screen(self, combo: QComboBox):
+        return next((s for s in QGuiApplication.screens() if s.name() == combo.currentData()), QGuiApplication.primaryScreen())
 
     def start_show(self, from_selected: bool):
         playlist = [p for p in self.items if p.enabled]
@@ -436,16 +527,26 @@ class MainWindow(QMainWindow):
             return
         start = 0
         if from_selected:
-            path = self._selected_path()
-            start = next((i for i, p in enumerate(playlist) if str(p.path) == path), 0)
+            key = self._selected_path()
+            start = next((i for i, p in enumerate(playlist) if str(p.path) == key), 0)
         self._save_settings()
-        self.controller = ShowController(playlist, self._show_settings(), self)
+        settings = ShowSettings(
+            audience_screen=self._screen(self.beamer_combo),
+            console_screen=self._screen(self.console_combo),
+            windowed=self.windowed.isChecked(),
+            talk_minutes=self.talk_spin.value(),
+            auto_start=self.auto_spin.value(),
+            cache_root=self.cache_root,
+        )
+        self.controller = ShowController(playlist, self.prepared, self.bus, settings, self)
         self.controller.finished.connect(lambda index: self._on_show_finished(playlist, index))
+        self.hide()
         self.controller.start(start)
 
     def _on_show_finished(self, playlist: list[Presentation], index: int):
         self.controller.deleteLater()
         self.controller = None
+        self.show()
         if 0 <= index < len(playlist):
             target = str(playlist[index].path)
             for i in range(self.list.count()):

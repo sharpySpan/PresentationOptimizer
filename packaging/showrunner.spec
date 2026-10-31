@@ -1,32 +1,37 @@
-# PyInstaller spec - builds dist/Showrunner.app.  Run via packaging/build_mac.sh.
+# PyInstaller spec for macOS, Windows and Linux. Run via the build script for your platform.
 import os
 import sys
+
+from PyInstaller.utils.hooks import collect_data_files
 
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 sys.path.insert(0, ROOT)
 from showrunner import __version__
-ICON = os.path.join(SPECPATH, "Showrunner.icns")
 
 a = Analysis(
     [os.path.join(ROOT, "run_showrunner.py")],
     pathex=[ROOT],
+    # The bundled ffmpeg binary lives in imageio_ffmpeg/binaries.
+    datas=collect_data_files("imageio_ffmpeg"),
     hiddenimports=["PySide6.QtMultimedia", "PySide6.QtMultimediaWidgets"],
-    excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore", "PySide6.QtQuick"],
+    excludes=["tkinter", "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.Qt3DCore",
+              "PySide6.QtQuick", "PySide6.QtQml"],
 )
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="Showrunner", console=False)
 coll = COLLECT(exe, a.binaries, a.datas, name="Showrunner")
-app = BUNDLE(
-    coll,
-    name="Showrunner.app",
-    icon=ICON if os.path.exists(ICON) else None,
-    bundle_identifier="app.showrunner.presentations",
-    version=__version__,
-    info_plist={
-        "CFBundleDisplayName": "Showrunner",
-        "CFBundleShortVersionString": __version__,
-        "LSMinimumSystemVersion": "11.0",
-        "NSHighResolutionCapable": True,
-        "NSAppleEventsUsageDescription": "Showrunner opens each presentation in Keynote or PowerPoint and starts the slideshow.",
-    },
-)
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        coll,
+        name="Showrunner.app",
+        bundle_identifier="app.showrunner.presentations",
+        version=__version__,
+        info_plist={
+            "CFBundleDisplayName": "Showrunner",
+            "CFBundleShortVersionString": __version__,
+            "LSMinimumSystemVersion": "11.0",
+            "NSHighResolutionCapable": True,
+            "NSAppleEventsUsageDescription": "Showrunner asks Keynote to convert presentations before the show.",
+        },
+    )
