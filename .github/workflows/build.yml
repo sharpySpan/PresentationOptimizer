@@ -115,7 +115,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxinerama1 libnss3 libcairo2 libcups2 libglib2.0-0 libdbus-1-3 libxrandr2 libsm6 \n            libegl1 libgl1 libxkbcommon0 libfontconfig1
+          sudo apt-get install -y libxinerama1 libnss3 libcairo2 libcups2 libglib2.0-0 libdbus-1-3 libxrandr2 libsm6 \
+            libegl1 libgl1 libxkbcommon0 libfontconfig1
       - name: Install dependencies
         shell: bash
         run: pip install -r requirements.txt python-pptx pytest
