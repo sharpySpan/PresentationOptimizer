@@ -45,7 +45,10 @@ own PowerPoint/Keynote), Showrunner shows the PDF and still takes notes and soun
 3. Press **Start the show**.
 
 Everything else is automatic:
-- **Screens:** the beamer goes on the external screen and the console on the laptop.
+- **Screens:** the beamer goes on the external screen and the console on the laptop's own screen.
+  Not sure which is which? *Identify screens* puts a big number on each one; *Swap* flips them.
+  If the beamer just copies the laptop (duplicate/mirror), only one screen exists: click
+  *Use the beamer as a second screen* (Windows switches to Extend; on a Mac it opens Displays).
 - **Sound:** follows the computer's current output.
 - **New files:** students' files added later appear at the bottom.
 - **Replaced files:** they get prepared again.

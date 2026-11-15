@@ -11,11 +11,11 @@ from PySide6.QtCore import QFileSystemWatcher, QObject, QSettings, QSize, QStand
 from PySide6.QtGui import QColor, QDesktopServices, QGuiApplication, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSlider, QSpinBox, QStyle,
-    QTextBrowser, QVBoxLayout, QWidget,
+    QListWidget, QListWidgetItem, QMainWindow, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider, QSpinBox,
+    QStyle, QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from . import libreoffice, system
+from . import libreoffice, screens, system
 from .audio import AudioBus
 from .library import Presentation, kind_for, load_order, natural_key, needs_converter, save_order
 from .prepare import CACHE_DIRNAME, Prepared, PrepareWorker, is_current, load_cached
@@ -98,12 +98,6 @@ class ConverterDownload(QObject):
             self.done.emit(str(exc) or exc.__class__.__name__)
 
 
-def _screen_id(screen) -> str:
-    """Name plus position: two identical monitors ("Generic PnP Monitor") still tell apart."""
-    g = screen.geometry()
-    return f"{screen.name()}@{g.x()},{g.y()}"
-
-
 def _readable_dir(path: Path) -> bool:
     try:
         next(path.iterdir(), None)
@@ -175,8 +169,12 @@ class MainWindow(QMainWindow):
         self._ensure_converter()
         QShortcut(QKeySequence("Alt+S"), self, self.bus.toggle_mute)
         app = QGuiApplication.instance()
-        app.screenAdded.connect(lambda _: self._fill_screens())
-        app.screenRemoved.connect(lambda _: self._fill_screens())
+        self.screens_timer = QTimer(self, singleShot=True, interval=400)
+        self.screens_timer.timeout.connect(self._fill_screens)
+        app.screenAdded.connect(self._watch_screen)
+        app.screenRemoved.connect(lambda _: self.screens_timer.start())
+        for screen in app.screens():
+            self._watch_screen(screen, refill=False)
 
     # --- UI ------------------------------------------------------------------
 
@@ -286,9 +284,36 @@ class MainWindow(QMainWindow):
         self.talk_spin.setSpecialValueText("No limit")
         self.auto_spin = QSpinBox(minimum=0, maximum=120, suffix=" s")
         self.auto_spin.setSpecialValueText("Off - wait for →")
+        for combo in (self.beamer_combo, self.console_combo):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(18)
+        self.beamer_combo.setToolTip("The screen the audience sees: slides and videos, nothing else")
+        self.console_combo.setToolTip("Your screen: speaker notes, next slide, timer and sound controls")
+        self.beamer_combo.activated.connect(lambda _: self._on_screen_chosen(self.beamer_combo))
+        self.console_combo.activated.connect(lambda _: self._on_screen_chosen(self.console_combo))
+        identify = QPushButton("Identify screens")
+        identify.setToolTip("Shows a big number on every screen for a few seconds")
+        identify.clicked.connect(self._identify_screens)
+        swap = QPushButton("⇅ Swap")
+        swap.setToolTip("Swap beamer and console")
+        swap.clicked.connect(self._swap_screens)
+        screen_buttons = QHBoxLayout()
+        screen_buttons.addWidget(identify)
+        screen_buttons.addWidget(swap)
+        screen_buttons.addStretch(1)
+        self.screen_hint = QLabel()
+        self.screen_hint.setWordWrap(True)
+        self.screen_hint.setStyleSheet("color:#c98a00;")
+        self.screen_hint.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.extend_button = QPushButton("Use the beamer as a second screen")
+        self.extend_button.clicked.connect(self._extend_displays)
+        self.overlays = []
         show_form = QFormLayout()
         show_form.addRow("Beamer", self.beamer_combo)
         show_form.addRow("Console", self.console_combo)
+        show_form.addRow(screen_buttons)
+        show_form.addRow(self.screen_hint)
+        show_form.addRow(self.extend_button)
         show_form.addRow(self.windowed)
         show_form.addRow("Talk length", self.talk_spin)
         show_form.addRow("Auto-start next", self.auto_spin)
@@ -394,28 +419,74 @@ class MainWindow(QMainWindow):
         self.device_combo.blockSignals(False)
         self.bus.set_device_by_name(self.device_combo.currentData())
 
+    def _watch_screen(self, screen, refill: bool = True):
+        # Switching from duplicate to extend often just moves or resizes an existing screen.
+        screen.geometryChanged.connect(lambda _: self.screens_timer.start())
+        if refill:
+            self.screens_timer.start()
+
     def _fill_screens(self):
-        screens = QGuiApplication.screens()
-        primary = QGuiApplication.primaryScreen()
-        for combo, key, prefer_primary in ((self.beamer_combo, "beamer", False), (self.console_combo, "console", True)):
+        found = screens.ordered()
+        beamer_default, console_default = screens.default_pair(found)
+        for combo, key, default in ((self.beamer_combo, "beamer", beamer_default),
+                                    (self.console_combo, "console", console_default)):
             wanted = combo.currentData() if combo.count() else self.settings.value(key, "")
             combo.clear()
-            for screen in screens:
-                g = screen.geometry()
-                label = f"{screen.name()}  ({g.width()}×{g.height()})" + ("  - main" if screen is primary else "")
-                combo.addItem(label, _screen_id(screen))
+            for number, screen in enumerate(found, 1):
+                combo.addItem(screens.label(screen, number), screens.screen_id(screen))
+                combo.setItemData(number - 1, screens.label(screen, number), Qt.ToolTipRole)
+            combo.view().setMinimumWidth(combo.view().sizeHintForColumn(0) + 24)  # Full names in the list
             index = combo.findData(wanted)
             if index < 0 and wanted:  # Saved under an older id, or the screen moved: match by name.
                 name = str(wanted).split("@")[0]
-                index = next((i for i, s in enumerate(screens) if s.name() == name), -1)
+                index = next((i for i, s in enumerate(found) if s.name() == name), -1)
             if index < 0:
-                # Defaults: console on the main screen, beamer on the first other screen.
-                index = next((i for i, s in enumerate(screens) if (s is primary) == prefer_primary), 0)
+                index = found.index(default)
             combo.setCurrentIndex(index)
-        if len(screens) > 1 and self.beamer_combo.currentIndex() == self.console_combo.currentIndex():
-            # e.g. saved on a laptop alone, now a beamer is plugged in: use it.
-            console = self.console_combo.currentIndex()
-            self.beamer_combo.setCurrentIndex(next(i for i in range(len(screens)) if i != console))
+        if len(found) > 1 and self.beamer_combo.currentIndex() == self.console_combo.currentIndex():
+            # e.g. saved on a laptop alone, now a beamer is plugged in: use the sensible pair.
+            self.beamer_combo.setCurrentIndex(found.index(beamer_default))
+            self.console_combo.setCurrentIndex(found.index(console_default))
+        self._update_screen_hint()
+
+    def _update_screen_hint(self):
+        count = len(QGuiApplication.screens())
+        if count == 1:
+            self.screen_hint.setText("Only one screen found. Beamer showing the same picture as this "
+                                     "computer? Then it's mirroring:")
+        elif self.beamer_combo.currentIndex() == self.console_combo.currentIndex():
+            self.screen_hint.setText("Beamer and console are the same screen: pick two different ones.")
+        else:
+            self.screen_hint.setText("")
+        self.screen_hint.setVisible(bool(self.screen_hint.text()))
+        self.extend_button.setVisible(count == 1)
+
+    def _on_screen_chosen(self, changed: QComboBox):
+        """Picking the console's screen for the beamer (or the other way round) swaps them."""
+        other = self.console_combo if changed is self.beamer_combo else self.beamer_combo
+        if changed.count() > 1 and changed.currentIndex() == other.currentIndex():
+            other.setCurrentIndex(next(i for i in range(other.count()) if i != changed.currentIndex()))
+        self._save_settings()
+        self._update_screen_hint()
+
+    def _swap_screens(self):
+        beamer, console = self.beamer_combo.currentIndex(), self.console_combo.currentIndex()
+        self.beamer_combo.setCurrentIndex(console)
+        self.console_combo.setCurrentIndex(beamer)
+        self._save_settings()
+        self._identify_screens()
+
+    def _identify_screens(self):
+        roles = {}
+        for combo, role in ((self.console_combo, "CONSOLE: you see this (notes, timer, sound)"),
+                            (self.beamer_combo, "BEAMER: the audience sees this")):
+            key = combo.currentData()
+            roles[key] = f"{roles[key]}\n{role}" if key in roles else role
+        self.overlays = screens.identify(roles)
+
+    def _extend_displays(self):
+        self.screen_hint.setText(screens.extend_displays())
+        self.screen_hint.setVisible(True)
 
     def closeEvent(self, event):
         self._save_settings()
@@ -751,13 +822,23 @@ class MainWindow(QMainWindow):
     # --- show ------------------------------------------------------------------
 
     def _screen(self, combo: QComboBox):
-        return next((s for s in QGuiApplication.screens() if _screen_id(s) == combo.currentData()),
+        return next((s for s in QGuiApplication.screens() if screens.screen_id(s) == combo.currentData()),
                     QGuiApplication.primaryScreen())
 
     def start_show(self, from_selected: bool):
         playlist = [p for p in self.items if p.enabled]
         if not playlist or self.controller is not None:
             return
+        if len(QGuiApplication.screens()) == 1 and not self.windowed.isChecked():
+            choice = QMessageBox.question(
+                self, "Only one screen",
+                "Only one screen is found, so the slides will fill this screen and there's no console "
+                "with notes and sound controls.\n\nIf a beamer is connected and shows the same picture "
+                "(duplicate/mirror), choose Cancel and click 'Use the beamer as a second screen'.\n\n"
+                "Start anyway?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if choice != QMessageBox.Yes:
+                return
         start = 0
         if from_selected:
             key = self._selected_path()

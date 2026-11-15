@@ -16,6 +16,14 @@ Back-to-back presentations without the set-up time: one folder, put the files in
 
 **Nothing to set up.** Install, open, and put the presentations in *Documents → Showrunner Presentations* (or drag them onto the list). If the computer has no PowerPoint or Keynote, Showrunner downloads the free LibreOffice converter by itself the first time it starts (~350 MB, one time only, no admin rights needed).
 
+## New in 1.2.1
+- Choosing the beamer: screens get clear names (laptop screen / extra screen), *Identify screens* shows a big
+  number on each one, *Swap* flips beamer and console, and picking the same screen twice is no longer possible
+- Beamer mirroring the laptop (only one screen found): Showrunner says so and switches to *Extend* with one click
+  (Windows) or opens the display settings (Mac); starting a show on one screen asks first
+- The console now defaults to the laptop's own screen, even when Windows made the beamer the main screen
+- Linux: the converter download tries other mirrors when one fails
+
 ## New in 1.2.0
 **Fixes**
 - "No such file or directory … pymupdf/layout/…" when preparing presentations in the installed app
